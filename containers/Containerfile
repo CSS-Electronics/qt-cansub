@@ -1,0 +1,87 @@
+# Build and tag using e.g. `> podman build --build-arg VCPKG_TRIPLET=arm64-linux -t cansub-builder-aarch64:vcpkg-2026.06.01 -f containers/Containerfile .`
+#                          `> podman build --build-arg VCPKG_TRIPLET=x64-linux -t cansub-builder-x64:vcpkg-2026.06.01 -f containers/Containerfile .`
+
+FROM ubuntu:22.04
+
+ARG VCPKG_TRIPLET
+
+# Ensure VCPKG_TRIPLET is set
+RUN if [ -z "$VCPKG_TRIPLET" ]; then \
+        echo "Error: VCPKG_TRIPLET argument is required." >&2; \
+        exit 1; \
+    fi
+
+# Avoid prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install build tools and Qt 5 and 6 development libraries
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    gdb \
+    python3 \
+    python3-pip \
+    zip \
+    unzip \
+    tar \
+    git \
+    git-lfs \
+    ninja-build \
+    pkg-config \
+    qtbase5-dev \
+    qttools5-dev \
+    qtdeclarative5-dev \
+    libqt5serialbus5-dev \
+    libqt5serialport5-dev \
+    libqt5svg5-dev \
+    libqt5x11extras5-dev \
+    libqt5websockets5-dev \
+    qt6-base-dev \
+    qt6-tools-dev \
+    qt6-scxml-dev \
+    libqt6serialbus6-bin \
+    libqt6serialbus6-dev \
+    libqt6serialport6-dev \
+    libqt6svg6-dev \
+    libqt6websockets6-dev \
+    && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# Install CMake from pip to get a version which is recent enough
+RUN pip install cmake && \
+    pip cache purge
+
+# Configure vcpkg
+ENV VCPKG_ROOT=/opt/vcpkg
+ENV VCPKG_DEFAULT_TRIPLET=$VCPKG_TRIPLET
+ENV VCPKG_TARGET_TRIPLET=$VCPKG_TRIPLET
+# f3e10653cc27d62a37a3763cd84b38bca07c6075
+ARG VCPKG_TAG=2026.06.01
+
+# Set environment variable to tell vcpkg to use system binaries for certain tools if needed
+ENV VCPKG_FORCE_SYSTEM_BINARIES=1
+
+# Configure a location in the container for the binary cache
+ENV VCPKG_DEFAULT_BINARY_CACHE=/var/cache/vcpkg
+RUN mkdir -p $VCPKG_DEFAULT_BINARY_CACHE
+
+RUN git clone --depth 1 --branch $VCPKG_TAG https://github.com/microsoft/vcpkg.git $VCPKG_ROOT \
+    && cd $VCPKG_ROOT \
+    && ./bootstrap-vcpkg.sh -disableMetrics
+
+# Manually build the required packages to the binary cache
+RUN echo "Building for triplet: $VCPKG_TRIPLET" && \
+    $VCPKG_ROOT/vcpkg install \
+    boost-crc \
+    boost-endian \
+    --triplet $VCPKG_TRIPLET && \
+    rm -rf $VCPKG_ROOT/buildtrees/* && \
+    rm -rf $VCPKG_ROOT/downloads/* && \
+    rm -rf $VCPKG_ROOT/installed/* && \
+    rm -rf $VCPKG_ROOT/packages/*
+
+# Tell CMake to always use vcpkg as the toolchain
+ENV CMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake
+
+WORKDIR /project

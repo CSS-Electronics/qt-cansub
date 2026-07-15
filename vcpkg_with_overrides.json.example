@@ -1,0 +1,69 @@
+{
+  "dependencies": [
+    "boost-crc",
+    "boost-endian",
+    {
+      "name": "qt5",
+      "features": ["serialbus", "websockets"],
+      "platform": "windows"
+    }
+  ],
+  "overrides": [
+    {
+      "name": "qt5",
+      "version": "5.15.2#1"
+    },
+    {
+      "name": "qt5-activeqt",
+      "version": "5.15.2#1"
+    },
+    {
+      "name": "qt5-base",
+      "version": "5.15.2#1"
+    },
+    {
+      "name": "qt5-declarative",
+      "version": "5.15.2#1"
+    },
+    {
+      "name": "qt5-essentials",
+      "version": "5.15.2#1"
+    },
+    {
+      "name": "qt5-imageformats",
+      "version": "5.15.2#1"
+    },
+    {
+      "name": "qt5-multimedia",
+      "version": "5.15.2#1"
+    },
+    {
+      "name": "qt5-networkauth",
+      "version": "5.15.2#1"
+    },
+    {
+      "name": "qt5-quickcontrols2",
+      "version": "5.15.2#1"
+    },
+    {
+      "name": "qt5-serialbus",
+      "version": "5.15.2#1"
+    },
+    {
+      "name": "qt5-serialport",
+      "version": "5.15.2#1"
+    },
+    {
+      "name": "qt5-svg",
+      "version": "5.15.2#1"
+    },
+    {
+      "name": "qt5-tools",
+      "version": "5.15.2#1"
+    },
+    {
+      "name": "qt5-websockets",
+      "version": "5.15.2#1"
+    }
+  ]
+}
