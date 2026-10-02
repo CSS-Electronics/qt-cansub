@@ -1,5 +1,6 @@
 {
   "dependencies": [
+    "boost-beast",
     "boost-crc",
     "boost-endian",
     {

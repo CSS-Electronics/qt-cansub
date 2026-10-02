@@ -13,15 +13,15 @@
 #include <QObject>
 #include <QTimer>
 #include <QtSerialBus/QCanBusDevice>
-#include <QtWebSockets/QWebSocket>
 
 #include "QtVersionHelper.hxx"
 #include "OAIDefaultApi.h"
 #include "FrameBuffer.hxx"
 #include "TlsPolicy.hxx"
+#include "WebSocket.hxx"
 
 /* Expected version string from the remote API */
-#define CANSUB_EXPECTED_VERSION                                 "03.00"
+#define CANSUB_EXPECTED_VERSION                                 "05.00"
 #define CANSUB_EXPECTED_VERSION_JSON                            "\"" CANSUB_EXPECTED_VERSION "\""
 
 /* Forward declaration of the resolver factory interface */
@@ -70,13 +70,11 @@ Q_DECLARE_METATYPE(CANsubBitTiming);
 #define CANsubConfigurationKeyBlockingWrite         CANsubConfigurationKey(8)
 
 /* Hostname to validate the remote certificate against when connecting via a raw IP address (QString).
- * The CANsub presents a certificate issued for its mDNS hostname, so when the user connects by IP there is
- * no name to verify against unless one is supplied here. Ignored when connecting by hostname. */
+ * The CANsub presents a certificate issued for its device ID and mDNS hostnames, so when the user connects by IP there
+ * is no name to verify against unless one is supplied here. Ignored when connecting by hostname. */
 #define CANsubConfigurationKeyExpectedHostname      CANsubConfigurationKey(9)
 
-/* Disable validation of the remote certificate entirely (boolean). Intended for connecting via a raw IP
- * address where no expected hostname is available. INSECURE: the connection is still encrypted but the
- * remote's identity is not verified. Defaults to false. */
+/* Deprecated */
 #define CANsubConfigurationKeyDisableCertificateValidation CANsubConfigurationKey(10)
 
 struct CANsubConnectionStates;
@@ -118,7 +116,7 @@ private:
 
     /* Connectivity. The websocket is owned via QObject parenting and is replaced by createWebSocket() on every
      * connection attempt. */
-    QWebSocket* webSocket = nullptr;
+    WebSocket* webSocket = nullptr;
     QTimer webSocketCloseTimeoutTimer;
     QNetworkAccessManager* const networkAccessManager;
     OpenAPI::OAIDefaultApi api;
@@ -142,7 +140,6 @@ private:
     /* Per-connection receive-forwarding policy. Refreshed from configuration on every open(), read by the
      * binaryMessageReceived handler that is wired once for the device's lifetime. */
     bool forwardFd = false;
-    bool forwardOwn = false;
 
     /* TLS identity policy, resolved once per open() from the device address and configuration parameters and shared
      * by both transports: a copy is pushed to the network access manager for the REST API, and the same policy is
@@ -181,6 +178,8 @@ private:
     void versionCheckErrorSlot(QString const& summary, QNetworkReply::NetworkError error, const QString& errorStr);
 
     void wsDataReceived(QByteArray const& data);
+
+    bool acceptSslErrors(QList<QSslError> const& errors) const;
 
     /* The following is all connect state-machine related */
     void stateMachineDestroy();

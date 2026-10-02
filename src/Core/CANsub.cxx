@@ -27,6 +27,7 @@ constexpr bool CANsubConfigurationKeyAutoReset_default = true;
 constexpr bool CANsubConfigurationKeyErrorFramesEnabled_default = false;
 constexpr bool CANsubConfigurationKeyUpdateTime_default = true;
 constexpr bool CANsubConfigurationKeyBlockingWrite_default = false;
+constexpr bool CANsubConfigurationKeyReceiveOwn_default = false;
 
 /* Default timeout (in ms) for API calls */
 #define CANSUB_API_DEFAULT_TIMEOUT_MS                           10000
@@ -129,29 +130,12 @@ CANsub::CANsub(QString const& address, uint8_t channel, ResolverFactory const* r
     connect(networkAccessManager, &QNetworkAccessManager::sslErrors, this,
             [this](QNetworkReply* reply, const QList<QSslError>& errors)
             {
-                /* With certificate validation disabled the request is issued with QSslSocket::VerifyNone, so
-                 * these errors are non-fatal and the request still completes. They are expected (a host-name
-                 * mismatch is unavoidable when connecting by IP), so do not report them as critical. */
-                if (tlsPolicy.disableValidation)
+                if (acceptSslErrors(errors))
                 {
-                    qDebug() << "Ignoring non-fatal SSL errors, certificate validation is disabled:" << errors;
-                    return;
-                }
-
-                for (const QSslError& error : errors)
-                {
-                    qCritical() << "SSL Error:" << error.errorString();
-                }
-
-                QSslConfiguration sslConfig = reply->sslConfiguration();
-                QList<QSslCertificate> chain = sslConfig.peerCertificateChain();
-
-                qCritical() << "Remote certificate chain (depth" << chain.size() << "):";
-                for (int i = 0; i < chain.size(); ++i)
-                {
-                    qCritical() << "  [" << i << "] Subject:" << chain[i].subjectInfo(QSslCertificate::CommonName)
-                        << "Issuer:" << chain[i].issuerInfo(QSslCertificate::CommonName)
-                        << "Expiry:" << chain[i].expiryDate().toString();
+                    /* The no-argument overload is used deliberately, as it is the only variant that works on every
+                     * supported Qt release, and the check function has already vetted the
+                     * complete error set of this handshake. This handling is only valid for this transaction. */
+                    reply->ignoreSslErrors();
                 }
             });
 
@@ -183,7 +167,7 @@ CANsub::CANsub(QString const& address, uint8_t channel, ResolverFactory const* r
         QPointer<CANsub> alive(this);
         webSocket->abort();
 
-        /* abort() only emits disconnected for an established connection, force the terminal state otherwise */
+        /* Below is a safeguard in case abort does not handle re-setting the state correctly */
         if (alive && state() == ClosingState)
         {
             setState(UnconnectedState);
@@ -211,9 +195,9 @@ void CANsub::createWebSocket()
         webSocket->deleteLater();
     }
 
-    webSocket = new QWebSocket(QString(), QWebSocketProtocol::VersionLatest, this);
+    webSocket = new WebSocket(this);
 
-    connect(webSocket, &QWebSocket::disconnected, this, [this]
+    connect(webSocket, &WebSocket::disconnected, this, [this]
     {
         webSocketCloseTimeoutTimer.stop();
         bool const wasConnected = (state() == ConnectedState);
@@ -228,87 +212,32 @@ void CANsub::createWebSocket()
     });
 
     /* Wire the receive handler once for the lifetime of the socket. The connection dies with it on replacement.
-     * The forwarding policy is read from the forwardFd/forwardOwn members, which are refreshed from configuration
+     * The forwarding policy is read from the forwardFd member, which are refreshed from configuration
      * on every open(). */
-    connect(webSocket, &QWebSocket::binaryMessageReceived, this, [this](QByteArray const& data)
+    connect(webSocket, &WebSocket::binaryMessageReceived, this, [this](QByteArray const& data)
     {
         wsDataReceived(data);
     });
 
     /* The socket is captured explicitly in the handlers below, so they always act on the instance that emitted,
      * never on a successor. */
-    connect(webSocket, CANSUB_WS_ERROR_SIGNAL, this,
+    connect(webSocket, &WebSocket::error, this,
             [this, socket = webSocket](QAbstractSocket::SocketError error)
             {
                 qCritical() << "WebSocket error: " << error;
                 recordPendingError(QStringLiteral("WebSocket error: %1").arg(socket->errorString()), QString(), ConnectionError);
             });
 
-    connect(webSocket, &QWebSocket::sslErrors, this, [this, socket = webSocket](const QList<QSslError>& errors)
+    connect(webSocket, &WebSocket::sslErrors, this, [this, socket = webSocket](const QList<QSslError>& errors)
     {
-        bool hostnameMatch = false;
-
-        /* We always connect to the resolved IP, so a HostNameMismatch is expected. Verify the certificate's identity
-         * against the verification hostname (the mDNS hostname, or the user-supplied expected hostname when connecting
-         * by IP) instead. */
-        for (const auto& error : errors)
-        {
-            if (error.error() == QSslError::HostNameMismatch)
-            {
-                /* When the user has explicitly disabled certificate validation (only allowed when connecting by IP),
-                 * accept whatever the remote presents. The connection stays encrypted, but the remote identity is
-                 * not verified. */
-                if (tlsPolicy.disableValidation)
-                {
-                    qWarning() << "Certificate validation is disabled, skipping host name mismatch error";
-                    hostnameMatch = true;
-                    break;
-                }
-
-                /* Handle to the certificate the remote presented */
-                const QSslCertificate& cert = error.certificate();
-
-                /* Check if the Common Name matches
-                 * NOTE: We always expect the common name to be populated for the CANsub certificate */
-                QStringList commonNames = cert.subjectInfo(QSslCertificate::SubjectInfo::CommonName);
-                if (commonNames.length() != 1)
-                {
-                    /* There should never be more than one common name in the subject field */
-                    qCritical() << "SSL connection failed with non-recoverable errors:" << errors;
-                    return;
-                }
-                if (commonNames.first() == tlsPolicy.verificationHostname)
-                {
-                    hostnameMatch = true;
-                    break;
-                }
-
-                /* Check if any of the Subject Alternative Names matches */
-                for (auto const& san : cert.subjectAlternativeNames().values(QSsl::DnsEntry))
-                {
-                    if (san == tlsPolicy.verificationHostname)
-                    {
-                        hostnameMatch = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        /* If the hostname does match and is the only error, tell the websocket to ignore the errors and continue the
-         * connection attempt. Any other error or a wrong expected hostname should result in the connection failing. */
-        if (hostnameMatch && errors.size() == 1)
+        if (acceptSslErrors(errors))
         {
             /* The no-argument overload is used deliberately, as it is the only variant that reaches the in-flight
-             * socket on every supported Qt release, and the guard above has already vetted the complete error set of
+             * socket on every supported Qt release, and the check function has already vetted the complete error set of
              * this handshake. It does latch ignore-everything on this QWebSocket instance for the rest of its life,
              * which is contained: createWebSocket() gives every connection attempt a fresh instance, so the latch
              * never outlives the attempt it was vetted for. */
             socket->ignoreSslErrors();
-        }
-        else
-        {
-            qCritical() << "WebSocket SSL connection failed with non-recoverable errors:" << errors;
         }
     });
 }
@@ -591,7 +520,6 @@ void CANsub::setConfigurationParameter(CANBUS_CONFIGURATION_KEY key, const QVari
         case CANsubConfigurationKeyListenOnly:
         case CANsubConfigurationKeyAutoReset:
         case CANsubConfigurationKeyErrorFramesEnabled:
-        case CANsubConfigurationKeyDisableCertificateValidation:
         {
             if (!configurationHelperForwardIfValid<bool>(key, value))
             {
@@ -599,6 +527,11 @@ void CANsub::setConfigurationParameter(CANBUS_CONFIGURATION_KEY key, const QVari
                     GET_VARIANT_TYPE(value));
                 setError(errorMsg, ConfigurationError);
             }
+            break;
+        }
+        case CANsubConfigurationKeyDisableCertificateValidation:
+        {
+            qWarning() << "The DisableCertificateValidation configuration key has been deprecated and no longer has any effect";
             break;
         }
         case CANsubConfigurationKeySamplePoint:
@@ -695,7 +628,7 @@ bool CANsub::writeFrame(const QCanBusFrame& frame)
                 bool timedOut = false;
                 timeoutTimer.setSingleShot(true);
                 timeoutTimer.setInterval(1000);
-                connect(webSocket, &QWebSocket::bytesWritten, &loop, &QEventLoop::quit);
+                connect(webSocket, &WebSocket::bytesWritten, &loop, &QEventLoop::quit);
                 connect(&timeoutTimer, &QTimer::timeout, &loop, [&loop, &timedOut]
                 {
                     timedOut = true;
@@ -832,17 +765,10 @@ void CANsub::wsDataReceived(QByteArray const& data)
         std::remove_if(
             receivedFrames.begin(),
             receivedFrames.end(),
-            [forwardFd = forwardFd, forwardOwn = forwardOwn](QCanBusFrame const& v)
+            [forwardFd = forwardFd](QCanBusFrame const& v)
             {
                 if (!forwardFd && (v.frameType() == QCanBusFrame::FrameType::DataFrame) && (v.
                     hasFlexibleDataRateFormat()))
-                {
-                    return true;
-                }
-                if (!forwardOwn &&
-                    ((v.frameType() == QCanBusFrame::FrameType::RemoteRequestFrame) || (v.frameType() ==
-                        QCanBusFrame::FrameType::DataFrame)) &&
-                    v.hasLocalEcho())
                 {
                     return true;
                 }
@@ -853,6 +779,52 @@ void CANsub::wsDataReceived(QByteArray const& data)
     {
         enqueueReceivedFrames(receivedFrames);
     }
+}
+
+bool CANsub::acceptSslErrors(QList<QSslError> const& errors) const
+{
+    bool validCertificateChain = false;
+
+    /* We always connect to the resolved IP, so a HostNameMismatch is expected. Verify the certificate's identity
+     * against the verification hostname (the mDNS hostname, or the user-supplied expected hostname when connecting by
+     * IP) instead. If no hostname is supplied, accept a hostname mismatch, but ensure that the certificate *is* the
+     * correct root certificate. */
+    if ((errors.size() == 1) && (errors.first().error() == QSslError::HostNameMismatch))
+    {
+        /* If no hostname is set, we are connecting by IP and only require the root certificate to be valid. */
+        if (tlsPolicy.verificationHostname.isEmpty())
+        {
+            qWarning() << "Hostname validation is disabled, but correct root found";
+            return true;
+        }
+
+        /* The hostname must either be part of the common name or one of the SANs */
+        auto const& certificate = errors.first().certificate();
+        QStringList commonNames = certificate.subjectInfo(QSslCertificate::SubjectInfo::CommonName);
+        if (commonNames.length() != 1)
+        {
+            /* There should never be more than one common name in the subject field */
+            qWarning() << "Invalid device certificate";
+            return false;
+        }
+        if (commonNames.first().compare("CANsub " + tlsPolicy.verificationHostname, Qt::CaseInsensitive) == 0)
+        {
+            /* Full match */
+            return true;
+        }
+
+        /* Check if any of the Subject Alternative Names matches */
+        for (auto const& san : certificate.subjectAlternativeNames().values(QSsl::DnsEntry))
+        {
+            if (san.compare(tlsPolicy.verificationHostname, Qt::CaseInsensitive) == 0)
+            {
+                return true;
+            }
+        }
+    }
+
+    qCritical() << "SSL connection failed with non-recoverable errors:" << errors;
+    return false;
 }
 
 void CANsub::versionCheckSlot(QString const& value)
@@ -1013,41 +985,27 @@ bool CANsub::resolveTlsPolicy()
     {
         /* Hostname connection. Verify the certificate against the hostname. */
         tlsPolicy.verificationHostname = deviceAddress;
-        tlsPolicy.disableValidation = false;
         nam->setTlsPolicy(tlsPolicy);
         return true;
     }
 
-    /* IP connection. The certificate is issued for the mDNS hostname and cannot match the IP, so the user
-     * must tell us how to handle verification. */
-    QVariant const disableValidationRaw = configurationParameter(CANsubConfigurationKeyDisableCertificateValidation);
-    bool const disableValidation = disableValidationRaw.isValid() && disableValidationRaw.canConvert<bool>() && disableValidationRaw.toBool();
-
+    /* IP connection. The certificate is issued for the mDNS hostname and cannot match the IP, so the user ought to
+     * tell us how to handle verification via the expected hostname. */
     QVariant const expectedHostNameRaw = configurationParameter(CANsubConfigurationKeyExpectedHostname);
     QString const expectedHostname = (expectedHostNameRaw.isValid() && expectedHostNameRaw.canConvert<QString>()) ? expectedHostNameRaw.toString() : QString();
-
-    if (disableValidation)
-    {
-        qWarning() << "Connecting to" << deviceAddress << "with certificate validation disabled. The connection is encrypted but unauthenticated.";
-        tlsPolicy.verificationHostname.clear();
-        tlsPolicy.disableValidation = true;
-        nam->setTlsPolicy(tlsPolicy);
-        return true;
-    }
 
     if (!expectedHostname.isEmpty())
     {
         /* Verify the certificate against the user-supplied hostname instead of the IP. */
         tlsPolicy.verificationHostname = expectedHostname;
-        tlsPolicy.disableValidation = false;
         nam->setTlsPolicy(tlsPolicy);
         return true;
     }
 
-    QString const errorMsg = QString("Connecting by IP (%1) requires either an expected hostname (CANsubConfigurationKeyExpectedHostname) or disabling certificate validation (CANsubConfigurationKeyDisableCertificateValidation)").arg(deviceAddress);
-    qCritical() << errorMsg;
-    recordPendingError(errorMsg, QString(), ConfigurationError);
-    return false;
+    /* Fallback. No hostname supplied but we still verify the certificate chain. */
+    tlsPolicy.verificationHostname.clear();
+    nam->setTlsPolicy(tlsPolicy);
+    return true;
 }
 
 void CANsub::configureLookupState(CANsubConnectionStates const& connectionStates)
@@ -1184,13 +1142,14 @@ static std::optional<qint64> remoteClockDeltaMs(QList<QVariant> const& args)
         qWarning() << "Invalid number of arguments";
         return std::nullopt;
     }
-    if (GET_VARIANT_TYPE(args.at(0)) != QMetaType::QDateTime)
+    if (GET_VARIANT_TYPE(args.at(0)) != qMetaTypeId<OpenAPI::OAITime>())
     {
         qWarning() << "Invalid type";
         return std::nullopt;
     }
 
-    QDateTime value = args.at(0).toDateTime();
+    const auto time = args.at(0).value<OpenAPI::OAITime>();
+    QDateTime value = time.getUtc();
 
     /* The generated client emits the success signal with a default-constructed QDateTime when an HTTP 200 body
      * fails to parse. toMSecsSinceEpoch() on it is undefined, so reject it here. */
@@ -1273,7 +1232,10 @@ void CANsub::configureSetTimeState(CANsubConnectionStates const& connectionState
         {
             qDebug() << "Entering setTimeState";
 
-            api.apiTimePut(QDateTime::currentDateTimeUtc());
+            OpenAPI::OAITime time;
+            time.setUtc(QDateTime::currentDateTimeUtc());
+            time.setRatePpb(0);
+            api.apiTimePut(time);
         },
         &OpenAPI::OAIDefaultApi::apiTimePutSignal, connectionStates.setBusPhy,
         &OpenAPI::OAIDefaultApi::apiTimePutSignalError, connectionStates.error,
@@ -1405,6 +1367,16 @@ bool CANsub::configureSetBusPhyState(CANsubConnectionStates const& connectionSta
         {
             command.setErrorFrames(errorFramesEnabled.toBool());
         }
+
+        QVariant const receiveOwn = configurationParameter(QCanBusDevice::ConfigurationKey::ReceiveOwnKey);
+        if (!receiveOwn.isValid())
+        {
+            command.setTxAckFrames(CANsubConfigurationKeyReceiveOwn_default);
+        }
+        else
+        {
+            command.setTxAckFrames(receiveOwn.toBool());
+        }
     }
 
     wireRequestState(
@@ -1525,12 +1497,10 @@ void CANsub::configureOpenWebsocketState(CANsubConnectionStates const& connectio
     /* Resolve the per-connection forwarding policy. These feed the binaryMessageReceived handler that is wired once
      * in the constructor, so they must be set before the websocket opens. */
     QVariant const forwardFdRaw = configurationParameter(QCanBusDevice::ConfigurationKey::CanFdKey);
-    QVariant const forwardOwnRaw = configurationParameter(QCanBusDevice::ConfigurationKey::ReceiveOwnKey);
     QVariant const blockRaw = configurationParameter(CANsubConfigurationKeyBlockingWrite);
     blockingWrites = (blockRaw.isValid() && blockRaw.canConvert<bool>()) ? blockRaw.value<bool>() : false;
 
     forwardFd = (forwardFdRaw.isValid()) ? forwardFdRaw.value<bool>() : false;
-    forwardOwn = (forwardOwnRaw.isValid()) ? forwardOwnRaw.value<bool>() : false;
 
     connect(connectionStates.openWebSocket, &QState::entered, this, [this]
     {
@@ -1542,16 +1512,12 @@ void CANsub::configureOpenWebsocketState(CANsubConnectionStates const& connectio
         remote.setPort(443);
         remote.setPath(QString("/api/can/%1/ws").arg(deviceChannel));
 
-        /* Start from the shared configuration that trusts only the embedded CANsub root certificate. When validation
-         * is disabled, verify nothing at all so the disable path enforces identically to the REST transport: no
-         * sslErrors are raised and the reactive handler is bypassed. Otherwise the handler verifies the presented
-         * certificate against tlsPolicy.verificationHostname (a HostNameMismatch is expected, as we connect by IP). */
+        /* Start from the shared configuration that trusts only the embedded CANsub root certificate. The hostname
+         * is verified against tlsPolicy.verificationHostname if set (a HostNameMismatch is expected, as we connect
+         * by IP). */
         QSslConfiguration sslConfiguration = coreSslConfiguration();
-        if (tlsPolicy.disableValidation)
-        {
-            sslConfiguration.setPeerVerifyMode(QSslSocket::VerifyNone);
-        }
         webSocket->setSslConfiguration(sslConfiguration);
+        webSocket->setPeerVerifyName(tlsPolicy.verificationHostname);
         webSocket->open(remote);
     });
 
@@ -1584,16 +1550,16 @@ void CANsub::configureOpenWebsocketState(CANsubConnectionStates const& connectio
         recordPendingError(QStringLiteral("Timed out opening websocket (channel %1)").arg(deviceChannel), QString(), ConnectionError);
     });
 
-    connectionStates.openWebSocket->addTransition(webSocket, &QWebSocket::connected, settleState);
-    connectionStates.openWebSocket->addTransition(webSocket, CANSUB_WS_ERROR_SIGNAL, connectionStates.error);
-    connectionStates.openWebSocket->addTransition(webSocket, &QWebSocket::disconnected, connectionStates.error);
+    connectionStates.openWebSocket->addTransition(webSocket, &WebSocket::connected, settleState);
+    connectionStates.openWebSocket->addTransition(webSocket, &WebSocket::error, connectionStates.error);
+    connectionStates.openWebSocket->addTransition(webSocket, &WebSocket::disconnected, connectionStates.error);
     connectionStates.openWebSocket->addTransition(connectTimeoutTimer, &QTimer::timeout, connectionStates.error);
 
     /* The settle timer drives the transition into the final connected state. A websocket error during the settle
      * window still routes to the error state. */
     settleState->addTransition(settleTimer, &QTimer::timeout, connectionStates.connected);
-    settleState->addTransition(webSocket, CANSUB_WS_ERROR_SIGNAL, connectionStates.error);
-    settleState->addTransition(webSocket, &QWebSocket::disconnected, connectionStates.error);
+    settleState->addTransition(webSocket, &WebSocket::error, connectionStates.error);
+    settleState->addTransition(webSocket, &WebSocket::disconnected, connectionStates.error);
 }
 
 void CANsub::configureTerminalStates(CANsubConnectionStates const& connectionStates)

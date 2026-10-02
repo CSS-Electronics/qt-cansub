@@ -15,8 +15,10 @@ add_library(${PROJECT_NAME} STATIC
   OAIFrame.h
   OAIPhy.h
   OAIStatus.h
+  OAITime.h
   OAITransmit_sequence.h
   OAI_api_info_get_200_response.h
+  OAI_api_time_ptp_get_200_response.h
   OAIDefaultApi.h
   OAIHelpers.h
   OAIHttpRequest.h
@@ -31,8 +33,10 @@ add_library(${PROJECT_NAME} STATIC
   OAIFrame.cpp
   OAIPhy.cpp
   OAIStatus.cpp
+  OAITime.cpp
   OAITransmit_sequence.cpp
   OAI_api_info_get_200_response.cpp
+  OAI_api_time_ptp_get_200_response.cpp
   OAIDefaultApi.cpp
   OAIHelpers.cpp
   OAIHttpRequest.cpp
@@ -54,7 +58,14 @@ target_link_libraries(${PROJECT_NAME}
 
 )
 
-set_target_properties(${PROJECT_NAME} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# CSS: Custom start
+# Since we link the code statically, allow the linker to GC all unused code
+if(MSVC)
+    target_compile_options(${PROJECT_NAME} PRIVATE /Gy /Gw)
+else()
+    target_compile_options(${PROJECT_NAME} PRIVATE -ffunction-sections -fdata-sections)
+endif()
+# CSS: Custom end
 
 configure_package_config_file(${CMAKE_CURRENT_SOURCE_DIR}/Config.cmake.in
     "${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}Config.cmake"

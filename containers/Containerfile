@@ -1,5 +1,5 @@
-# Build and tag using e.g. `> podman build --build-arg VCPKG_TRIPLET=arm64-linux -t cansub-builder-aarch64:vcpkg-2026.06.01 -f containers/Containerfile .`
-#                          `> podman build --build-arg VCPKG_TRIPLET=x64-linux -t cansub-builder-x64:vcpkg-2026.06.01 -f containers/Containerfile .`
+# Build and tag using e.g. `> podman build --build-arg VCPKG_TRIPLET=arm64-linux-release -t cansub-builder-aarch64:vcpkg-2026.06.01 -f containers/Containerfile .`
+#                          `> podman build --build-arg VCPKG_TRIPLET=x64-linux-release -t cansub-builder-x64:vcpkg-2026.06.01 -f containers/Containerfile .`
 
 FROM ubuntu:22.04
 
@@ -56,8 +56,12 @@ RUN pip install cmake && \
 ENV VCPKG_ROOT=/opt/vcpkg
 ENV VCPKG_DEFAULT_TRIPLET=$VCPKG_TRIPLET
 ENV VCPKG_TARGET_TRIPLET=$VCPKG_TRIPLET
-# f3e10653cc27d62a37a3763cd84b38bca07c6075
+# The vcpkg checkout doubles as the package registry: vcpkg-configuration.json declares a "builtin" default registry,
+# so vcpkg resolves ports and versions from the git history of $VCPKG_ROOT instead of fetching the upstream repository
+# each time we configure the project (https://github.com/microsoft/vcpkg). The checkout therefore has to contain the
+# baseline commit named in vcpkg-configuration.json.
 ARG VCPKG_TAG=2026.06.01
+ARG VCPKG_BASELINE=f3e10653cc27d62a37a3763cd84b38bca07c6075
 
 # Set environment variable to tell vcpkg to use system binaries for certain tools if needed
 ENV VCPKG_FORCE_SYSTEM_BINARIES=1
@@ -73,6 +77,7 @@ RUN git clone --depth 1 --branch $VCPKG_TAG https://github.com/microsoft/vcpkg.g
 # Manually build the required packages to the binary cache
 RUN echo "Building for triplet: $VCPKG_TRIPLET" && \
     $VCPKG_ROOT/vcpkg install \
+    boost-beast \
     boost-crc \
     boost-endian \
     --triplet $VCPKG_TRIPLET && \

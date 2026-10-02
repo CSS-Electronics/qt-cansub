@@ -4,14 +4,21 @@ project(CANsub)
 
 enable_language(CXX)
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED YES)
+set(CMAKE_CXX_EXTENSIONS NO)
+
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 
 option(USE_QT6 "Build against Qt6 instead of Qt5" OFF)
 
 # Version strings
-set(CANSUB_DATEVER "2026.07.14")
-set(CANSUB_DATEVER_COMPAT "20260714")
+set(CANSUB_DATEVER "2026.09.28")
+set(CANSUB_DATEVER_COMPAT "20260928")
 
-set(QT_REQUIRED_COMPONENTS Core Network SerialBus WebSockets)
+set(QT_REQUIRED_COMPONENTS Core Network SerialBus)
 
 if(USE_QT6)
     find_package(QT NAMES Qt6 REQUIRED)
@@ -23,7 +30,7 @@ else()
 endif()
 
 # Find required dependencies
-find_package(Boost REQUIRED COMPONENTS crc endian)
+find_package(Boost REQUIRED COMPONENTS beast crc endian)
 find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS ${QT_REQUIRED_COMPONENTS})
 
 # Manually add required third-party dependencies.
@@ -31,21 +38,35 @@ add_subdirectory(thirdparty/OAPI)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build QMdnsEngine as a shared library" FORCE)
 add_subdirectory(thirdparty/qmdnsengine)
 
+# Since we link the code statically, allow the linker to GC all unused code.
+# Set here to keep the vendored sources unmodified.
+if(MSVC)
+    target_compile_options(qmdnsengine PRIVATE /Gy /Gw)
+else()
+    target_compile_options(qmdnsengine PRIVATE -ffunction-sections -fdata-sections)
+endif()
+
 # ----------------------------------------------------------------------------------------------------------------------
 # Common interface library for settings
 # ----------------------------------------------------------------------------------------------------------------------
 set(COMMON_TARGET_NAME "${PROJECT_NAME}Common-Qt${QT_VERSION_MAJOR}")
 add_library(${COMMON_TARGET_NAME} INTERFACE)
 
-set_property(TARGET ${COMMON_TARGET_NAME} PROPERTY POSITION_INDEPENDENT_CODE ON)
-set_property(TARGET ${COMMON_TARGET_NAME} PROPERTY CXX_STANDARD_REQUIRED YES)
-set_property(TARGET ${COMMON_TARGET_NAME} PROPERTY CXX_EXTENSIONS NO)
-
 if(${MSVC})
     # Use the conformant lambda processor. The default (legacy) processor incorrectly considers any use of a member
     # of the enclosing class inside a lambda as requiring a 'this' capture, even calls to static members such as
     # QObject::connect (warning C4573). Conformant by default only from /std:c++20, so request it explicitly here.
     target_compile_options(${COMMON_TARGET_NAME} INTERFACE /Zc:lambda)
+
+    target_compile_options(${COMMON_TARGET_NAME} INTERFACE /Gy /Gw)
+else()
+    target_compile_options(${COMMON_TARGET_NAME} INTERFACE -ffunction-sections -fdata-sections)
+endif()
+
+if(WIN32)
+    # Boost.Asio warns on every translation unit unless the minimum Windows version is set. Windows 7 matches the
+    # oldest version supported by Qt 5.15, and is also the value Asio falls back to when left undefined.
+    target_compile_definitions(${COMMON_TARGET_NAME} INTERFACE _WIN32_WINNT=0x0601)
 endif()
 
 # General Qt configuration.
@@ -56,9 +77,6 @@ elseif(${CMAKE_BUILD_TYPE} STREQUAL "Release")
     message(STATUS "Building release version")
     target_compile_definitions(${COMMON_TARGET_NAME} INTERFACE QT_NO_DEBUG)
     target_compile_definitions(${COMMON_TARGET_NAME} INTERFACE QT_NO_DEBUG_OUTPUT)
-    if(${MSVC})
-        set_target_properties(${COMMON_TARGET_NAME} PROPERTIES LINK_FLAGS_RELEASE "/DEBUG:NONE")
-    endif()
 else()
     message(FATAL_ERROR "Building unsupported version: \"${${CMAKE_BUILD_TYPE}}\"")
 endif()
@@ -92,6 +110,8 @@ set(SOURCE_FILES_CORE
     src/Core/QtVersionHelper.hxx
     src/Core/ResolverFactory.hxx
     src/Core/TlsPolicy.hxx
+    src/Core/WebSocket.cxx
+    src/Core/WebSocket.hxx
 )
 
 # Embed the root certificate into the core library (see Certificate.cxx for the Q_INIT_RESOURCE handling required when
@@ -99,8 +119,6 @@ set(SOURCE_FILES_CORE
 qt_add_resources(SOURCE_FILES_CORE src/Core/resources.qrc)
 
 add_library(${CORE_TARGET_NAME} OBJECT ${SOURCE_FILES_CORE})
-set_property(TARGET ${CORE_TARGET_NAME} PROPERTY AUTOMOC ON)
-set_property(TARGET ${CORE_TARGET_NAME} PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(${CORE_TARGET_NAME} PUBLIC ${COMMON_TARGET_NAME})
 target_link_libraries(${CORE_TARGET_NAME} PUBLIC Boost::boost)
 foreach (QT_COMPONENT ${QT_REQUIRED_COMPONENTS})
@@ -130,7 +148,6 @@ set(SOURCE_FILES_PLUGIN
 )
 
 add_library(${TARGET_NAME} MODULE ${SOURCE_FILES_PLUGIN})
-set_property(TARGET ${TARGET_NAME} PROPERTY AUTOMOC ON)
 target_include_directories(${TARGET_NAME} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(${TARGET_NAME} PRIVATE ${COMMON_TARGET_NAME} ${CORE_TARGET_NAME})
 
@@ -139,4 +156,10 @@ if(UNIX AND NOT APPLE)
     if(CMAKE_BUILD_TYPE STREQUAL "Release")
         target_link_options(${TARGET_NAME} PRIVATE "-Wl,-s")
     endif()
+endif()
+
+if(MSVC)
+    target_link_options(${TARGET_NAME} PRIVATE /OPT:REF /OPT:ICF $<$<CONFIG:Debug>:/INCREMENTAL:NO> $<$<CONFIG:Release>:/DEBUG:NONE>)
+else()
+    target_link_options(${TARGET_NAME} PRIVATE "-Wl,--gc-sections")
 endif()

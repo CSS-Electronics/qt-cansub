@@ -8,15 +8,12 @@
 #if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
 #define CANBUS_CONFIGURATION_KEY QCanBusDevice::ConfigurationKey
 #define GET_VARIANT_TYPE(v) (v).typeId()
-#define CANSUB_WS_ERROR_SIGNAL qOverload<QAbstractSocket::SocketError>(&QWebSocket::errorOccurred)
 #elif QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
 #define CANBUS_CONFIGURATION_KEY QCanBusDevice::ConfigurationKey
 #define GET_VARIANT_TYPE(v) (v).typeId()
-#define CANSUB_WS_ERROR_SIGNAL qOverload<QAbstractSocket::SocketError>(&QWebSocket::error)
 #else
 #define CANBUS_CONFIGURATION_KEY int
 #define GET_VARIANT_TYPE(v) (v).userType()
-#define CANSUB_WS_ERROR_SIGNAL qOverload<QAbstractSocket::SocketError>(&QWebSocket::error)
 #endif
 
 /* Re-label a QDateTime as UTC without converting its calendar digits. QDateTime::setTimeSpec is deprecated from

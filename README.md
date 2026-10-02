@@ -41,7 +41,6 @@ The plugin depends on the following Qt modules:
 * Network
 * SerialBus
 * StateMachine (Qt 6)
-* WebSockets
 
 **These must all be present at runtime for the plugin to work**. Core and SerialBus are likely always present in any application the plugin would be used with.
 
@@ -54,6 +53,10 @@ The repository contains a pre-built plugin for Qt 5:
 ## Limitations
 
 * The plugin is currently unable to detect a network issue/power loss at the remote device.
+
+## Connecting by IP
+
+The plugin is designed around using auto-discovered devices over mDNS. If this fails, e.g. due to no mDNS forwarding between subnets, it is possible to connect via IP instead. The syntax will then be `IPv4 address@channel` instead of `mDNS hostname@channel`, e.g. `10.123.45.1@1`. In this mode, the communication between the CANsub device and the application is still secure, but since there is no hostname information, the hostname verification is disabled. To enforce hostname verification as well, the syntax `IPv4 address:expected device id@channel` must be used. This should be just the device ID, e.g. `11223344` instead of `11223344-eth.local`, so the resulting string becomes `10.123.45.1:11223344@1`.
 
 ## Supported configuration options
 
@@ -87,7 +90,7 @@ All these are supported with a sample point at 80 %, and can be configured via t
 
 The device does not support loopback mode, so `QCanBusDevice::LoopbackKey` cannot be changed from the default value of false.
 
-The CANsub device will always send a transmit acknowledgement. To ignore these, the `QCanBusDevice::ReceiveOwnKey` can be set to false, and the plugin will not forward these frames to the application. The default value is false.
+The CANsub device can forward transmit acknowledgement. To ignore these, the `QCanBusDevice::ReceiveOwnKey` can be set to false. The default value is false.
 
 Aside from these standard Qt CAN configuration options, a series of additional user keys are supported.
 
@@ -99,8 +102,8 @@ Aside from these standard Qt CAN configuration options, a series of additional u
 * `CANsubConfigurationKeyBitTimingData` (QCanBusDevice::UserKey + 6) - Manually configure the full bit-timing configuration for the data phase of CAN operation. Overrides data bitrate if set alongside `CANsubConfigurationKeyBitTiming`. Is not set by default.
 * `CANsubConfigurationKeyUpdateTime` (QCanBusDevice::UserKey + 7) - Controls if the plugin synchronizes the remote clock on connection. Defaults to true.
 * `CANsubConfigurationKeyBlockingWrite` (QCanBusDevice::UserKey + 8) - Controls if the plugin soft-blocks when writing to the CAN bus if the remote is not able to enqueue any more frames for transmition, up to 1 s. Defaults to false.
-* `CANsubConfigurationKeyExpectedHostname` (QCanBusDevice::UserKey + 9) - When connecting via a raw IP address, the remote certificate is validated against this hostname instead of the IP. The CANsub presents a certificate issued for its mDNS hostname, so this allows full certificate validation even when connecting by IP. Ignored when connecting by hostname. Is not set by default.
-* `CANsubConfigurationKeyDisableCertificateValidation` (QCanBusDevice::UserKey + 10) - When connecting via a raw IP address, set to true to disable validation of the remote certificate entirely. The connection remains encrypted but the remote's identity is **not** verified, so this is insecure and only intended as a fallback when no expected hostname is available. Defaults to false. When connecting by IP, either this or `CANsubConfigurationKeyExpectedHostname` must be set, otherwise the connection attempt fails with a configuration error.
+* `CANsubConfigurationKeyExpectedHostname` (QCanBusDevice::UserKey + 9) - When connecting via a raw IP address, the remote certificate is validated against this hostname instead of the IP. The CANsub presents a certificate issued for its device ID and mDNS hostnames, so this allows full certificate validation even when connecting by IP. Ignored when connecting by hostname. Is not set by default. If this is not set and connecting by IP, the remote certificate hostname is not validated, but the root certificate is still verified.
+* `CANsubConfigurationKeyDisableCertificateValidation` (QCanBusDevice::UserKey + 10) - Deprecated.
 
 ## Building
 
@@ -109,6 +112,7 @@ The project has the following additional third party dependencies when building:
 * [Boost](https://www.boost.org/)
     * [CRC](https://www.boost.org/library/1.90.0/crc/) (1.90.0 or later)
     * [Endian](https://www.boost.org/library/1.90.0/endian/) (1.90.0 or later)
+    * [Beast](https://www.boost.org/library/1.90.0/beast/) (1.90.0 or later)
 * [Qt 5 or Qt 6](https://www.qt.io/)
 
 The project is configured to be built using CMake (version 3.30 or higher) with [vcpkg](https://github.com/microsoft/vcpkg) in manifest mode to handle these dependencies. The current targeted version of vcpkg is [2026.06.01](https://github.com/microsoft/vcpkg/releases/tag/2026.06.01). When using the manifest, Qt 5 will be installed, but only on Windows platforms. On Linux, usage of the system libraries instead is recommended. If building without vcpkg, ensure all the dependencies above are installed.
@@ -214,12 +218,12 @@ The project has a recipe for generating a container to build the project in. Thi
 
 ```
 # For x64:
-podman build --build-arg VCPKG_TRIPLET=x64-linux -t cansub-builder-x64:vcpkg-2026.06.01 -f containers/Containerfile .
-podman run --rm -v .:/project:Z cansub-builder-x64:vcpkg-2026.06.01 bash -c "cmake -B build -S . -GNinja -DCMAKE_BUILD_TYPE=Release -DVCPKG_TARGET_TRIPLET=x64-linux && cmake --build build"
+podman build --build-arg VCPKG_TRIPLET=x64-linux-release -t cansub-builder-x64:vcpkg-2026.06.01 -f containers/Containerfile .
+podman run --rm -v .:/project:Z cansub-builder-x64:vcpkg-2026.06.01 bash -c "cmake -B build -S . -GNinja -DCMAKE_BUILD_TYPE=Release -DVCPKG_TARGET_TRIPLET=x64-linux-release && cmake --build build"
 
 # For aarch64:
-podman build --build-arg VCPKG_TRIPLET=arm64-linux -t cansub-builder-aarch64:vcpkg-2026.06.01 -f containers/Containerfile .
-podman run --rm -v .:/project:Z cansub-builder-aarch64:vcpkg-2026.06.01 bash -c "cmake -B build -S . -GNinja -DCMAKE_BUILD_TYPE=Release -DVCPKG_TARGET_TRIPLET=arm64-linux && cmake --build build"
+podman build --build-arg VCPKG_TRIPLET=arm64-linux-release -t cansub-builder-aarch64:vcpkg-2026.06.01 -f containers/Containerfile .
+podman run --rm -v .:/project:Z cansub-builder-aarch64:vcpkg-2026.06.01 bash -c "cmake -B build -S . -GNinja -DCMAKE_BUILD_TYPE=Release -DVCPKG_TARGET_TRIPLET=arm64-linux-release && cmake --build build"
 ```
 
 This will map the current directory to the `/project` directory inside the container, and build the plugin in the sub-folder `build`. Once done, extract the plugin from the build directory.

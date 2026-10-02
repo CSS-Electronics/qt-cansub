@@ -7,8 +7,10 @@ HEADERS += \
     $${PWD}/OAIFrame.h \
     $${PWD}/OAIPhy.h \
     $${PWD}/OAIStatus.h \
+    $${PWD}/OAITime.h \
     $${PWD}/OAITransmit_sequence.h \
     $${PWD}/OAI_api_info_get_200_response.h \
+    $${PWD}/OAI_api_time_ptp_get_200_response.h \
 # APIs
     $${PWD}/OAIDefaultApi.h \
 # Others
@@ -28,8 +30,10 @@ SOURCES += \
     $${PWD}/OAIFrame.cpp \
     $${PWD}/OAIPhy.cpp \
     $${PWD}/OAIStatus.cpp \
+    $${PWD}/OAITime.cpp \
     $${PWD}/OAITransmit_sequence.cpp \
     $${PWD}/OAI_api_info_get_200_response.cpp \
+    $${PWD}/OAI_api_time_ptp_get_200_response.cpp \
 # APIs
     $${PWD}/OAIDefaultApi.cpp \
 # Others

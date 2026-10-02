@@ -65,9 +65,14 @@ Plugin::Plugin() :
         qRegisterMetaType<QHostAddress>("QHostAddress");
     }
 
+    /* Finally, handle the API mismatch in the OpenAPI registration */
+    if (!isMetaTypeRegistered("OAITime"))
+    {
+        qRegisterMetaType<OpenAPI::OAITime>("OAITime");
+    }
+
     /* Set default OpenAPI parameters */
-    /* NOTE: The default generated OpenAPI helpers cannot figure out the string termination */
-    OpenAPI::setDateTimeFormat("\"yyyy-MM-ddTHH:mm:ss.zzzZ\"");
+    OpenAPI::setDateTimeFormat("yyyy-MM-ddTHH:mm:ss.zzzZ");
 
     /* Point the OpenAPI client at the shared, statically-stored SSL configuration that trusts only the embedded CANsub
      * root certificate. The configuration outlives the plugin, so the raw pointer kept by  the worker can never
@@ -231,10 +236,18 @@ QList<QCanBusDeviceInfo> Plugin::availableDevices(QString* errorMessage) const
 
 QCanBusDevice* Plugin::createDevice(QString const& interfaceName, QString* errorMessage) const
 {
-    /* We expect the address format to be hostname@channel or ip@channel */
+    /* We expect the address format to be hostname@channel, ip@channel or ip:expected@channel */
     static auto reList = QVector<QPair<QRegularExpression, std::function<bool(QString const &address)>>>({
         QPair(
-            QRegularExpression(R"(^([\d]{1,3}\.[\d]{1,3}\.[\d]{1,3}\.[\d]{1,3})@([1-4]{1})$)"),
+            QRegularExpression(R"(^(?<address>[a-fA-F\d]{8}-(?:eth|usb)\.local)@(?<channel>[1-4]{1})$)"),
+            [](QString const &address)
+            {
+                /* No need for additional address verification, the regex already matches it */
+                return true;
+            }
+            ),
+        QPair(
+            QRegularExpression(R"(^(?<address>[\d]{1,3}\.[\d]{1,3}\.[\d]{1,3}\.[\d]{1,3}):(?<expected_host>[a-fA-F\d]{8})@(?<channel>[1-4]{1})$)"),
             [](QString const &address)
             {
                 /* Ensure this is a valid IPv4 range */
@@ -242,11 +255,11 @@ QCanBusDevice* Plugin::createDevice(QString const& interfaceName, QString* error
             }
             ),
         QPair(
-            QRegularExpression(R"(^([a-fA-F\d]{8}-(?:eth|usb)\.local)@([1-4]{1})$)"),
+            QRegularExpression(R"(^(?<address>[\d]{1,3}\.[\d]{1,3}\.[\d]{1,3}\.[\d]{1,3})@(?<channel>[1-4]{1})$)"),
             [](QString const &address)
             {
-                /* No need for additional address verification, the regex already matches it */
-                return true;
+                /* Ensure this is a valid IPv4 range */
+                return QHostAddress(address).protocol() == QAbstractSocket::IPv4Protocol;
             }
             ),
     });
@@ -266,7 +279,14 @@ QCanBusDevice* Plugin::createDevice(QString const& interfaceName, QString* error
             continue;
         }
 
-        auto const address = m.captured(1);
+        /* All expressions should at least have an address and channel parameter */
+        if (m.captured("address").isNull() || m.captured("channel").isNull())
+        {
+            continue;
+        }
+
+        /* Ensure that this is a valid address (the second member in our list) */
+        auto const address = m.captured("address");
         if (!re.second(address))
         {
             continue;
@@ -275,7 +295,18 @@ QCanBusDevice* Plugin::createDevice(QString const& interfaceName, QString* error
         /* NOTE: The only valid channels at the time of release are the values in (1, 2, 3, 4). However, we leave it
          *       up to the state machine to catch this during connection attempts, as there is no good way to here limit
          *       a CANsub.2 device to not take channel 4 as an argument. */
-        result = new CANsub(address, m.captured(2).toUInt(), this);
+        auto const channel = m.captured("channel").toUInt();
+
+        result = new CANsub(address, channel, this);
+
+        /* If this is an IPv4 address, we need to add additional handling for TLS. If the expected hostname is used,
+         * forward it via the settings. Else, tune down the TLS verification level. */
+        if (QHostAddress(address).protocol() == QAbstractSocket::IPv4Protocol)
+        {
+            auto const expectedHost = m.captured("expected_host");
+            qDebug() << "Expected host is" << expectedHost;
+            result->setConfigurationParameter(CANsubConfigurationKeyExpectedHostname, expectedHost);
+        }
 
         break;
     }
