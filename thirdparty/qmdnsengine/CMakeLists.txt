@@ -1,4 +1,7 @@
-cmake_minimum_required(VERSION 3.5)
+# Changes:
+# - Bump minimum CMake version
+# - Let outer scope determine Qt version
+cmake_minimum_required(VERSION 3.30)
 project(qmdnsengine)
 
 set(PROJECT_NAME "QMdnsEngine")
@@ -25,7 +28,6 @@ if (CMAKE_PREFIX_PATH)
 	message( STATUS "QMdnsEngine: Use CMAKE_PREFIX_PATH to locate Qt version to be used: ${CMAKE_PREFIX_PATH}" )
 endif()
 
-find_package(QT NAMES Qt6 Qt5 COMPONENTS Network REQUIRED)
 message( STATUS "QMdnsEngine: Found Qt Version: ${QT_VERSION}" )
 
 if (${QT_VERSION_MAJOR} GREATER_EQUAL 6 )
