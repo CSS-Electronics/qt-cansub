@@ -16,30 +16,31 @@
 #include <QString>
 #include <QtPlugin>
 
-#include "qmdnsengine/cache.h"
-#include "qmdnsengine/server.h"
+namespace CANsubQt
+{
 
-#include "ResolverFactory.hxx"
-
-class HostResolver;
-
-class Plugin : public QObject, public CAN_BUS_FACTORY_BASE, public ResolverFactory
+/**
+ * Qt CAN bus plugin "CANsub". Only the factory: Everything else is in Core.
+ *
+ * The constructor registers the metatypes used across threads, see registerMetaTypes().
+ */
+class Plugin : public QObject, public CAN_BUS_FACTORY_BASE
 {
     Q_OBJECT
-    Q_PLUGIN_METADATA(IID "org.qt-project.Qt.QCanBusFactory" FILE "plugin.json" )
-    Q_INTERFACES (CAN_BUS_FACTORY_BASE)
+    Q_PLUGIN_METADATA(IID "org.qt-project.Qt.QCanBusFactory" FILE "plugin.json")
+    Q_INTERFACES(CAN_BUS_FACTORY_BASE)
 
 public:
     Plugin();
     ~Plugin() override = default;
 
-    QList<QCanBusDeviceInfo> availableDevices(QString* errorMessage) const override;
-    QCanBusDevice* createDevice(QString const& interfaceName, QString* errorMessage) const override;
+    /** Discover devices with mDNS, see discoverDevices(). */
+    QList<QCanBusDeviceInfo> availableDevices(QString *errorMessage) const override;
 
-    HostResolver* createResolver(QByteArray const& name, QObject* parent) const override;
-
-private:
-    QMdnsEngine::Server* mdnsServer;
+    /** Create a device from an interface name, see CANsub::Target for the format. */
+    QCanBusDevice *createDevice(QString const &interfaceName, QString *errorMessage) const override;
 };
+
+} // namespace CANsubQt
 
 #endif // CANSUB_QT_CANSUB_PLUGIN_HXX

@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026.11.09 (API 05.00)
+
+### Changed
+
+* Switched core implementation, there is no longer a dependency on Qt for TLS.
+
 ## 2026.09.28 (API 05.00)
 
 ### Added

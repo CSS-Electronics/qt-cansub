@@ -1,43 +1,20 @@
 #ifndef CANSUB_QT_CANSUB_HXX
 #define CANSUB_QT_CANSUB_HXX
 
-#include <QtGlobal>
-
-#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
-#include <QtStateMachine/QStateMachine>
-#else
-#include <QStateMachine>
-#endif
-
 #include <optional>
+#include <QtGlobal>
+#include <QByteArray>
+#include <QList>
+#include <QMetaType>
 #include <QObject>
-#include <QTimer>
+#include <QString>
+#include <QVariant>
+#include <QVector>
 #include <QtSerialBus/QCanBusDevice>
+#include <QtSerialBus/QCanBusDeviceInfo>
+#include <QtSerialBus/QCanBusFrame>
 
-#include "QtVersionHelper.hxx"
-#include "OAIDefaultApi.h"
-#include "FrameBuffer.hxx"
-#include "TlsPolicy.hxx"
-#include "WebSocket.hxx"
-
-/* Expected version string from the remote API */
-#define CANSUB_EXPECTED_VERSION                                 "05.00"
-#define CANSUB_EXPECTED_VERSION_JSON                            "\"" CANSUB_EXPECTED_VERSION "\""
-
-/* Forward declaration of the resolver factory interface */
-struct ResolverFactory;
-
-struct CANsubBitTiming
-{
-    quint16 brp;
-    quint16 tseg1;
-    quint16 tseg2;
-    quint16 sjw;
-};
-
-Q_DECLARE_METATYPE(CANsubBitTiming);
-
-/* Additional configuration parameters */
+/* Additional configuration parameters. The values are part of the public interface and must never change. */
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
 #define CANsubConfigurationKey(x) static_cast<QCanBusDevice::ConfigurationKey>(static_cast<int>(QCanBusDevice::ConfigurationKey::UserKey) + (x))
 #else
@@ -57,10 +34,10 @@ Q_DECLARE_METATYPE(CANsubBitTiming);
  * Sample point is used to look for a proper bit timing configuration. */
 #define CANsubConfigurationKeySamplePoint           CANsubConfigurationKey(4)
 
-/* Bit-timing configuration for classical/non-BRS section (CANsubBitTiming) */
+/* Bit-timing configuration for classical/non-BRS section (CANsubQt::BitTiming) */
 #define CANsubConfigurationKeyBitTiming             CANsubConfigurationKey(5)
 
-/* Bit-timing configuration for BRS section (CANsubBitTiming) */
+/* Bit-timing configuration for BRS section (CANsubQt::BitTiming) */
 #define CANsubConfigurationKeyBitTimingData         CANsubConfigurationKey(6)
 
 /* Should the timebase on the remote CANsub be updated if too out of sync (boolean)? */
@@ -71,222 +48,220 @@ Q_DECLARE_METATYPE(CANsubBitTiming);
 
 /* Hostname to validate the remote certificate against when connecting via a raw IP address (QString).
  * The CANsub presents a certificate issued for its device ID and mDNS hostnames, so when the user connects by IP there
- * is no name to verify against unless one is supplied here. Ignored when connecting by hostname. */
+ * is no name to verify against unless one is supplied, here or as the device ID in the interface name
+ * (`<IPv4 address>:<device ID>@<channel>`), which is the default of this key. Accepted are the device ID and the device
+ * hostnames (`<device ID>-usb.local` and `<device ID>-eth.local`), as the certificate is verified against the device ID
+ * derived from them. An empty string only validates the root certificate. Ignored when connecting by hostname. */
 #define CANsubConfigurationKeyExpectedHostname      CANsubConfigurationKey(9)
 
-/* Deprecated */
+/* Deprecated. Has no effect. */
 #define CANsubConfigurationKeyDisableCertificateValidation CANsubConfigurationKey(10)
 
-struct CANsubConnectionStates;
+struct cansub_frame;
+class QHostAddress;
+class QTimer;
 
-struct CANsub : public QCanBusDevice
+namespace CANsubQt
 {
-    Q_OBJECT;
+
+class Connection;
+class HostLookup;
+
+/**
+ * Bit timing of one CAN phase, as used by the REST API of the device (80 MHz CAN clock).
+ *
+ * tseg1 excludes the sync segment: A bit is 1 + tseg1 + tseg2 time quanta, and the sample point is after
+ * 1 + tseg1 time quanta. E.g. brp 4, tseg1 63, tseg2 16 is 250 kbit/s with an 80 % sample point.
+ */
+struct BitTiming
+{
+    quint16 brp;
+    quint16 tseg1;
+    quint16 tseg2;
+    quint16 sjw;
+};
+
+class CANsub : public QCanBusDevice
+{
+    Q_OBJECT
 
 public:
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+    using ConfigurationKeyType = QCanBusDevice::ConfigurationKey;
+#else
+    using ConfigurationKeyType = int;
+#endif
+
     /**
-     * Create a new CANsub QCanBusDevice
+     * Connection target, parsed from an interface name.
      *
-     * @param address Address for the remote CANsub device to connect to
-     * @param channel Channel at the remote to use
-     * @param resolverFactory Factory used to create mDNS host resolvers (provided by the plugin)
-     * @param parent Qt parent
+     * The interface name is one of:
+     * - `<device ID>-usb.local@<channel>` or `<device ID>-eth.local@<channel>`: The device certificate is verified
+     *   against the hostname. The short forms without `.local` are rejected.
+     * - `<IPv4 address>:<device ID>@<channel>`: The device certificate is verified against the device ID.
+     * - `<IPv4 address>@<channel>`: Only the root certificate is verified.
+     *
+     * The device ID is 8 hex digits, the IPv4 address is in dotted decimal (e.g. `192.168.1.100`) and the channel is 1
+     * to 4. The device is always reached at port 443. For an IPv4 address, CANsubConfigurationKeyExpectedHostname
+     * overrides the device ID to verify the certificate against.
+     *
+     * Examples: `aabbccdd-usb.local@1`, `192.168.1.100:aabbccdd@1`, `192.168.1.100@1`.
      */
-    explicit CANsub(QString const& address, uint8_t channel, ResolverFactory const* resolverFactory,
-                    QObject* parent = nullptr);
+    struct Target
+    {
+        QString interfaceName;
+        QString host;
+        /* True if host is an IPv4 address, false for a device hostname */
+        bool ipv4 = false;
+        quint32 channel = 0;
+        /* Device ID after the ':' (lower case), or empty */
+        QString deviceId;
+    };
+
+    /**
+     * Parse an interface name, see Target for the format.
+     *
+     * @return The target, or nothing with errorMessage set (if not NULL) to the reason.
+     */
+    static std::optional<Target> parseInterfaceName(QString const &interfaceName, QString *errorMessage);
+
+    /**
+     * Create a device for a target.
+     *
+     * Validates the connection options with the CANsub library.
+     *
+     * @return The device, or nullptr with errorMessage set (if not NULL) if the target cannot be used.
+     */
+    static CANsub *create(Target const &target, QString *errorMessage);
+
+    /**
+     * Device info for one channel of a discovered device.
+     *
+     * @param hostname mDNS hostname of the device. A trailing "." is removed.
+     * @param channel CAN channel, the first is 1.
+     * @return Device info with the interface name `<hostname>@<channel>`.
+     */
+    static QCanBusDeviceInfo createInfo(QString const &hostname, int channel);
 
     ~CANsub() override;
 
-    static QCanBusDeviceInfo createInfo(QString const& hostname, int channel);
-
-    bool writeFrame(const QCanBusFrame& frame) override;
-
-    QString interpretErrorFrame(const QCanBusFrame& errorFrame) override;
-
-    void setConfigurationParameter(CANBUS_CONFIGURATION_KEY key, const QVariant& value) override;
+    void setConfigurationParameter(ConfigurationKeyType key, QVariant const &value) override;
+    bool writeFrame(QCanBusFrame const &frame) override;
+    QString interpretErrorFrame(QCanBusFrame const &errorFrame) override;
 
 protected:
     bool open() override;
     void close() override;
 
 private:
-    /* Device address information */
-    QString const deviceAddress;
-    uint8_t const deviceChannel;
+    explicit CANsub(Target target);
 
-    /* Connectivity. The websocket is owned via QObject parenting and is replaced by createWebSocket() on every
-     * connection attempt. */
-    WebSocket* webSocket = nullptr;
-    QTimer webSocketCloseTimeoutTimer;
-    QNetworkAccessManager* const networkAccessManager;
-    OpenAPI::OAIDefaultApi api;
+    /**
+     * The device ID for a CANsubConfigurationKeyExpectedHostname value.
+     *
+     * @param expectedHostname A device ID, or a device hostname (`<device ID>-usb.local` or `<device ID>-eth.local`,
+     *        optionally with a trailing '.').
+     * @return The device ID in lower case, or nothing if the value is neither.
+     */
+    static std::optional<QString> expectedDeviceId(QString const &expectedHostname);
 
-    /* Storage */
-    FrameBuffer bufferRx;
-    QVector<QCanBusFrame> receivedFrames;
+    /* Settings of one connection, snapshotted by open(). Later changes of their configuration keys take effect on the
+     * next open(). */
+    struct Session
+    {
+        /* Device ID to verify the device certificate against, or empty */
+        QString deviceId;
+        /* Only verify the root certificate */
+        bool acceptAnyDevice = false;
+        bool canFd = true;
+        bool receiveOwn = false;
+        bool errorFrames = false;
+        bool blockingWrite = false;
+        bool updateTime = true;
+        std::optional<QCanBusFrame::FrameErrors> errorFilter;
+    };
 
-    ResolverFactory const* const resolverFactory;
-    QVariant version;
-    QVariant resolvedHost;
-    QStateMachine* connectionStateMachine;
+    /* Steps of a connect, in order. enterStep() starts a step, onResponse() evaluates the answer to its request. */
+    enum class Step
+    {
+        /* Not connecting or connected */
+        Idle,
+        /* Resolving the host with lookup */
+        Lookup,
+        /* Waiting for closingConnections to finish, as the device rejects the PHY configuration while the WebSocket
+         * of an earlier connection is still open */
+        WaitForClosing,
+        /* Creating the connection and querying the API version */
+        Version,
+        /* Querying the PTP status (UpdateTime only) */
+        PtpStatus,
+        /* Reading the device time (UpdateTime only, the device does not track a PTP master) */
+        GetTime,
+        /* Setting the device time (UpdateTime only, the device time is off) */
+        SetTime,
+        /* Configuring the PHY */
+        SetPhy,
+        /* Reading the filter IDs */
+        GetFilters,
+        /* Removing the filters in filtersToDelete, one at a time, the first one first */
+        DeleteFilters,
+        /* Adding the accept-all filter for standard IDs */
+        AddStandardFilter,
+        /* Adding the accept-all filter for extended IDs */
+        AddExtendedFilter,
+        /* Opening the data stream */
+        OpenData,
+        /* Waiting for the device to open the CAN controller, see settleTimer */
+        Settle,
+        /* ConnectedState */
+        Connected,
+    };
 
-    /* True while a blocking writeFrame() is inside its nested wait loop. Used to reject re-entrant blocking
-     * writes (a framesReceived emission dispatched from the nested loop can lead a client slot back into
-     * writeFrame), which would otherwise invert transmit order, consume the outer call's deadline and allow
-     * unbounded recursion. */
-    bool blockingWrites = false;
+    std::optional<QByteArray> buildPhyConfiguration(QString *errorMessage) const;
+    bool boolParameter(ConfigurationKeyType key, bool fallback) const;
+
+    void enterStep(Step next);
+    void sendRequest(QByteArray const &method, QByteArray const &path, QByteArray const &body);
+    void onResponse(Connection *source, Step requestStep, qint32 result, quint32 httpStatus,
+                    QByteArray const &body);
+    QString requestDescription() const;
+    void failOpen(QString const &message, CanBusError errorCode);
+    void retireConnection();
+
+    void onLookupResolved(HostLookup *source, QHostAddress const &address);
+    void onLookupFailed(HostLookup *source, QString const &message);
+    void onRetiredClosed(Connection *source);
+    void onOpened(Connection *source);
+    void onSettled();
+    void onFramesReceived(Connection *source, QVector<cansub_frame> const &frames);
+    void onClosed(Connection *source, qint32 error, QString const &message);
+
+    Target target;
+
+    /* Current step of the connect. */
+    Step step = Step::Idle;
+    /* PHY configuration (JSON) of the connection being opened. */
+    QByteArray phyConfiguration;
+    Session session;
+    /* Lookup of the connection being opened, or nullptr. Owned. */
+    HostLookup *lookup = nullptr;
+    /* IPv4 address the host resolved to, for the connection created in the Version step. */
+    quint32 resolvedAddress = 0;
+    /* Filters still to remove in the DeleteFilters step. The first one is being removed, and stays in the list until
+     * the device confirms it. */
+    QList<quint32> filtersToDelete;
+    /* Current connection, or nullptr. Owned, and deleted once closed. */
+    Connection *connection = nullptr;
+    /* Earlier connections still closing in the background. Owned, and deleted once closed. */
+    QVector<Connection *> closingConnections;
+    /* Delays ConnectedState after the data stream opened, see onOpened(). */
+    QTimer *settleTimer = nullptr;
+    /* A blocking writeFrame() waits in a nested event loop. */
     bool inBlockingWrite = false;
-
-    /* Per-connection receive-forwarding policy. Refreshed from configuration on every open(), read by the
-     * binaryMessageReceived handler that is wired once for the device's lifetime. */
-    bool forwardFd = false;
-
-    /* TLS identity policy, resolved once per open() from the device address and configuration parameters and shared
-     * by both transports: a copy is pushed to the network access manager for the REST API, and the same policy is
-     * read directly by the WebSocket sslErrors handler. */
-    TlsPolicy tlsPolicy;
-
-    /* Create and wire a fresh transport websocket, disposing of any previous instance. A websocket must never be
-     * reused across connection attempts. */
-    void createWebSocket();
-
-    /* True when the device address is a raw IP literal rather than an mDNS hostname. */
-    [[nodiscard]] bool addressIsIp() const;
-
-    /* Resolve the TLS identity policy (tlsPolicy) and push it to the network access manager. Returns false and sets a
-     * ConfigurationError if the combination of address and configuration cannot be validated. */
-    bool resolveTlsPolicy();
-
-    /* Error state tracking */
-    QString pendingErrorString;
-    QCanBusDevice::CanBusError pendingErrorCode = NoError;
-
-    /* Record a connection-phase error for the terminal error state to report. The first error recorded in an attempt
-     * wins, so a cascade of follow-up failures cannot clobber the root cause. `detail` is the network error string and
-     * may be empty, in which case `context` is used verbatim. */
-    void recordPendingError(QString const& context, QString const& detail, QCanBusDevice::CanBusError code);
-
-    /* Flush the recorded pending error (applying sensible fallbacks) to the QCanBusDevice error state. Shared by
-     * the terminal error state and the synchronous open() abort path. */
-    void reportPendingError();
-
-    /* Abort an in-progress open() call. Tear down the partially built state machine if one was allocated and flush the
-     * pending error. */
-    void abortOpen();
-
-    void versionCheckSlot(QString const& value);
-    void versionCheckErrorSlot(QString const& summary, QNetworkReply::NetworkError error, const QString& errorStr);
-
-    void wsDataReceived(QByteArray const& data);
-
-    bool acceptSslErrors(QList<QSslError> const& errors) const;
-
-    /* The following is all connect state-machine related */
-    void stateMachineDestroy();
-    void configureLookupState(CANsubConnectionStates const& connectionStates);
-    void configureGetVersionState(CANsubConnectionStates const& connectionStates);
-    void configureGetTimeState(CANsubConnectionStates const& connectionStates);
-    void configureSetTimeState(CANsubConnectionStates const& connectionStates);
-    bool configureSetBusPhyState(CANsubConnectionStates const& connectionStates);
-    void configureGetBusFiltersState(CANsubConnectionStates const& connectionStates);
-    void configureSetBusFiltersState(CANsubConnectionStates const& connectionStates);
-    void configureOpenWebsocketState(CANsubConnectionStates const& connectionStates);
-    void configureTerminalStates(CANsubConnectionStates const& connectionStates);
-
-    /**
-     * Statemachine wiring helper to simplify the connection state machine.
-     * Hardwired to use the OpenAPI as event emitter.
-     * @tparam OkSignal Type of signal emitted on Ok
-     * @tparam ErrSignal Type of signal emitted on Error
-     * @param state Starting state
-     * @param onEntered Callback to invoke on entering the starting state
-     * @param ok Signal emitted on Ok
-     * @param onOk Target state on Ok emitted
-     * @param err Signal emitted on Error
-     * @param onError Target state on Error emitted
-     */
-    template <typename OkSignal, typename ErrSignal>
-    void wireRequestState(QState* state, std::function<void()> onEntered, OkSignal ok, QAbstractState* onOk,
-                          ErrSignal err, QAbstractState* onError);
-
-    /**
-     * Statemachine wiring helper to simplify the connection statemachine.
-     * Hardwired to use the OpenAPI as event emitter.
-     * @tparam OkSignal Type of signal emitted on Ok
-     * @tparam ErrSignal Type of signal emitted on Error
-     * @param state Starting state
-     * @param onEntered Callback to invoke on entering the starting state
-     * @param ok Signal emitted on Ok
-     * @param onOk Target state on Ok emitted
-     * @param err Signal emitted on Error
-     * @param onError Target state on Error emitted
-     * @param errorContext Error context to append to the error state
-     * @param errorCode Error code to target
-     */
-    template <typename OkSignal, typename ErrSignal>
-    void wireRequestState(QState* state, std::function<void()> onEntered, OkSignal ok, QAbstractState* onOk,
-                          ErrSignal err, QAbstractState* onError,
-                          QString errorContext, QCanBusDevice::CanBusError errorCode = ConnectionError);
-
-    /**
-     * Generic statemachine wiring helper to simplify the connecting statemachine.
-     * @tparam OkSender Ok signal sender class type
-     * @tparam OkSignal Type of signal emitted on Ok
-     * @tparam ErrSender Error signal sender class type
-     * @tparam ErrSignal Type of signal emitted on Error
-     * @param state Starting state
-     * @param onEntered Callback to invoke on entering the starting state
-     * @param okSender Handle to the Ok event sender
-     * @param ok Signal emitted on Ok
-     * @param onOk Target state on Ok emitted
-     * @param errSender Handle to the Error event sender
-     * @param err Signal emitted on error
-     * @param onError Target state on Error emitted
-     */
-    template <typename OkSender, typename OkSignal, typename ErrSender, typename ErrSignal>
-    void wireGenericState(QState* state, std::function<void()> onEntered, OkSender okSender, OkSignal ok,
-                          QAbstractState* onOk, ErrSender errSender, ErrSignal err, QAbstractState* onError);
-
-    /* Fold an OpenAPI error signal's detail string into the pending error message. Two overloads cover the two
-     * shapes the generated client emits: (NetworkError, errorStr) for PUT/POST/DELETE and
-     * (summary, NetworkError, errorStr) for GETs. The capture is a direct connection on the state machine, so it
-     * runs before the machine processes the queued transition into the error state, and dies with the machine. */
-
-    /**
-     * Set the pending error state from an OpenAPI error signal
-     * @param err OpenAPI error signal
-     * @param errorContext Additional error context to set to the pending state
-     * @param errorCode Error code to set tot he pending state
-     */
-    void wireErrorCapture(void (OpenAPI::OAIDefaultApi::*err)(QNetworkReply::NetworkError, QString const&),
-                          QString errorContext, QCanBusDevice::CanBusError errorCode);
-
-    /**
-     * Set the pending error state from an OpenAPI error signal
-     * @tparam Summary OpenAPI summary type for error signal
-     * @param err OpenAPI error signal
-     * @param errorContext Additional error context to set to the pending state
-     * @param errorCode Error code to set to the pending state
-     */
-    template <typename Summary>
-    void wireErrorCapture(void (OpenAPI::OAIDefaultApi::*err)(Summary, QNetworkReply::NetworkError, QString const&),
-                          QString errorContext, QCanBusDevice::CanBusError errorCode);
-
-    /**
-     * Helper to simplify the storage of configuration settings
-     * @tparam T Type of the value to store in this key
-     * @param key Configuration key
-     * @param value Configuration value
-     * @return True if the value is set and of the correct type, or if the value is not set at all (to clear the value)
-     */
-    template <typename T>
-    bool configurationHelperForwardIfValid(CANBUS_CONFIGURATION_KEY key, QVariant const& value);
-signals:
-    /* Signals used internally during the connection process */
-    void versionCheckComplete(QPrivateSignal);
-    void versionCheckError(QPrivateSignal);
-    void dnsLookupComplete(QPrivateSignal);
-    void dnsLookupError(QPrivateSignal);
 };
+
+} // namespace CANsubQt
+
+Q_DECLARE_METATYPE(CANsubQt::BitTiming)
 
 #endif // CANSUB_QT_CANSUB_HXX

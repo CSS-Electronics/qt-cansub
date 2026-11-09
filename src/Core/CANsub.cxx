@@ -1,1608 +1,1278 @@
+#include "Logging.hxx"
+
 #include <algorithm>
-#include <functional>
+#include <limits>
 #include <optional>
+#include <utility>
 #include <QDateTime>
-#include <QDebug>
+#include <QEventLoop>
+#include <QHostAddress>
 #include <QPointer>
-#include <QSslSocket>
 #include <QTimer>
 
 #include "CANsub.hxx"
-#include "CANsubProtocol.hxx"
-#include "Certificate.hxx"
-#include "GuardedTransition.hxx"
-#include "HostResolver.hxx"
-#include "ResolverFactory.hxx"
-#include "QtVersionHelper.hxx"
-#include "BatchTracker.hxx"
-#include "LogicTransition.hxx"
-#include "NetworkManagerWithPeerInfo.hxx"
+#include "CANsubConnection.hxx"
+#include "CANsubFrames.hxx"
+#include "CANsubRest.hxx"
+#include "HostLookup.hxx"
 
-/* qint64 to match QWebSocket::bytesToWrite(), keeping the comparisons free of sign-conversion warnings */
-constexpr qint64 outstandingBytesLimit = 2048 * 10;
-constexpr unsigned closeHandshakeTimeoutMs = 2000;
-
-constexpr bool CANsubConfigurationKeyListenOnly_default = false;
-constexpr bool CANsubConfigurationKeyAutoReset_default = true;
-constexpr bool CANsubConfigurationKeyErrorFramesEnabled_default = false;
-constexpr bool CANsubConfigurationKeyUpdateTime_default = true;
-constexpr bool CANsubConfigurationKeyBlockingWrite_default = false;
-constexpr bool CANsubConfigurationKeyReceiveOwn_default = false;
-
-/* Default timeout (in ms) for API calls */
-#define CANSUB_API_DEFAULT_TIMEOUT_MS                           10000
-
-/* Default timeout (in ms) for the websocket call */
-#define CANSUB_WEBSOCKET_TIMEOUT_MS                             10000
-
-/* Default timeout (in ms) for the mDNS lookup */
-#define CANSUB_MDNS_TIMEOUT_MS                                  10000
-
-/* Settle delay (in ms) after the websocket connects, before reporting the bus as connected. The remote opens the
- * hardware CAN bus asynchronously after accepting the websocket, leaving a brief window in which the websocket is
- * not yet associated with the bus. */
-#define CANSUB_WS_SETTLE_MS                                     10
-
-/* Helper struct for storing all bit-timing parameters */
-struct CombinedBitTiming
+namespace CANsubQt
 {
-    uint brp;
-    uint tseg1;
-    uint tseg2;
-    uint sjw;
-    uint tseg1_data;
-    uint tseg2_data;
-    uint sjw_data;
-};
 
-/* When storing the CombinedBitTiming in a QMap, we need to support sorting. This combined key class handles this. */
-struct CombinedBitTimingKey
+Q_LOGGING_CATEGORY(lcCansub, "cansub")
+
+using Response = Connection::Response;
+
+/* Time until the host lookup gives up. */
+static constexpr int lookupTimeoutMs = 5000;
+
+/* Delay between the opened data stream and ConnectedState. The device opens the CAN controller asynchronously after
+ * accepting the WebSocket, and frames written before are lost. */
+static constexpr int settleTimeMs = 10;
+
+/* Total time a blocking writeFrame() waits for space. */
+static constexpr int blockingWriteTimeoutMs = 1000;
+
+/* The device time is set if it differs this much or more from the local time. */
+static constexpr qint64 timeToleranceMs = 1000;
+
+/* Sample point used if none is configured, in 0.01 %. */
+static constexpr quint32 defaultSamplePoint = 8000;
+
+/* Highest sample point, in 0.01 %. */
+static constexpr quint32 maximumSamplePoint = 10000;
+
+/* Lowest data bit rate used if none is configured. The device always runs CAN FD, so a data phase is always needed. */
+static constexpr quint32 minimumDefaultDataBitRate = 1000000;
+
+/* The key as an int, so one switch works with the int keys of Qt5 and the enum keys of Qt6, including user keys. */
+static constexpr int keyValue(CANsub::ConfigurationKeyType key)
 {
-    uint samplePoint;
-    uint bitrate;
-    uint bitrateData;
-
-    bool operator<(CombinedBitTimingKey const& other) const
-    {
-        return std::tie(samplePoint, bitrate, bitrateData) < std::tie(other.samplePoint, other.bitrate, other.bitrateData);
-    }
-
-    bool operator==(CombinedBitTimingKey const& other) const
-    {
-        return std::tie(samplePoint, bitrate, bitrateData) == std::tie(other.samplePoint, other.bitrate, other.bitrateData);
-    }
-};
-
-struct CANsubConnectionStates
-{
-    QState* lookupHost;
-    QState* getVersion;
-    QState* getTime;
-    QState* setTime;
-    QState* setBusPhy;
-    QState* getBusFilters;
-    QState* setBusFilters;
-    QState* openWebSocket;
-    QFinalState* connected;
-    QFinalState* error;
-};
-
-static CANsubConnectionStates allocateStates(QStateMachine* stateMachine)
-{
-    CANsubConnectionStates result = {nullptr};
-
-    result.lookupHost = new QState(stateMachine);
-    result.getVersion = new QState(stateMachine);
-    result.getTime = new QState(stateMachine);
-    result.setTime = new QState(stateMachine);
-    result.setBusPhy = new QState(stateMachine);
-    result.getBusFilters = new QState(stateMachine);
-    result.setBusFilters = new QState(stateMachine);
-    result.openWebSocket = new QState(stateMachine);
-    result.connected = new QFinalState(stateMachine);
-    result.error = new QFinalState(stateMachine);
-
-    return result;
+    return static_cast<int>(key);
 }
 
-/**
- * Internal helper function to map bit-rates to bit-timings via a sample point.
- * @param bitrate Target bitrate
- * @param bitrateData Target data bit-rate
- * @param samplePoint Target sample point
- * @return Matching bit-timing parameters or empty if none found
- */
-static std::optional<CombinedBitTiming> getBitTiming(uint bitrate, uint bitrateData, uint samplePoint);
-
-
-CANsub::CANsub(QString const& address, uint8_t channel, ResolverFactory const* resolverFactory, QObject* parent) :
-    QCanBusDevice(parent),
-    deviceAddress(address),
-    deviceChannel(channel),
-    networkAccessManager(new NetworkManagerWithPeerInfo(this)),
-    bufferRx(100 * 1024),
-    resolverFactory(resolverFactory),
-    connectionStateMachine(nullptr),
-    blockingWrites(false)
+/* Name of a configuration key for messages. */
+static QString keyName(CANsub::ConfigurationKeyType key)
 {
-    api.setNetworkAccessManager(networkAccessManager);
+    switch (keyValue(key))
+    {
+    case keyValue(QCanBusDevice::RawFilterKey):
+    {
+        return QStringLiteral("RawFilterKey");
+    }
+    case keyValue(QCanBusDevice::ErrorFilterKey):
+    {
+        return QStringLiteral("ErrorFilterKey");
+    }
+    case keyValue(QCanBusDevice::LoopbackKey):
+    {
+        return QStringLiteral("LoopbackKey");
+    }
+    case keyValue(QCanBusDevice::ReceiveOwnKey):
+    {
+        return QStringLiteral("ReceiveOwnKey");
+    }
+    case keyValue(QCanBusDevice::BitRateKey):
+    {
+        return QStringLiteral("BitRateKey");
+    }
+    case keyValue(QCanBusDevice::CanFdKey):
+    {
+        return QStringLiteral("CanFdKey");
+    }
+    case keyValue(QCanBusDevice::DataBitRateKey):
+    {
+        return QStringLiteral("DataBitRateKey");
+    }
+    case keyValue(CANsubConfigurationKeyListenOnly):
+    {
+        return QStringLiteral("CANsubConfigurationKeyListenOnly");
+    }
+    case keyValue(CANsubConfigurationKeyAutoReset):
+    {
+        return QStringLiteral("CANsubConfigurationKeyAutoReset");
+    }
+    case keyValue(CANsubConfigurationKeyErrorFramesEnabled):
+    {
+        return QStringLiteral("CANsubConfigurationKeyErrorFramesEnabled");
+    }
+    case keyValue(CANsubConfigurationKeySamplePoint):
+    {
+        return QStringLiteral("CANsubConfigurationKeySamplePoint");
+    }
+    case keyValue(CANsubConfigurationKeyBitTiming):
+    {
+        return QStringLiteral("CANsubConfigurationKeyBitTiming");
+    }
+    case keyValue(CANsubConfigurationKeyBitTimingData):
+    {
+        return QStringLiteral("CANsubConfigurationKeyBitTimingData");
+    }
+    case keyValue(CANsubConfigurationKeyUpdateTime):
+    {
+        return QStringLiteral("CANsubConfigurationKeyUpdateTime");
+    }
+    case keyValue(CANsubConfigurationKeyBlockingWrite):
+    {
+        return QStringLiteral("CANsubConfigurationKeyBlockingWrite");
+    }
+    case keyValue(CANsubConfigurationKeyExpectedHostname):
+    {
+        return QStringLiteral("CANsubConfigurationKeyExpectedHostname");
+    }
+    case keyValue(CANsubConfigurationKeyDisableCertificateValidation):
+    {
+        return QStringLiteral("CANsubConfigurationKeyDisableCertificateValidation");
+    }
+    default:
+    {
+        break;
+    }
+    }
 
-    connect(networkAccessManager, &QNetworkAccessManager::sslErrors, this,
-            [this](QNetworkReply* reply, const QList<QSslError>& errors)
-            {
-                if (acceptSslErrors(errors))
-                {
-                    /* The no-argument overload is used deliberately, as it is the only variant that works on every
-                     * supported Qt release, and the check function has already vetted the
-                     * complete error set of this handshake. This handling is only valid for this transaction. */
-                    reply->ignoreSslErrors();
-                }
-            });
+    return QString::number(keyValue(key));
+}
 
-    /* Set the default values for the static configuration parameters */
+/* A configuration value as an unsigned 32-bit number, or nothing if it is not one. */
+static std::optional<quint32> toUnsigned(QVariant const &value)
+{
+    bool ok = false;
+    qlonglong const number = value.toLongLong(&ok);
+    if (!ok || number < 0 || number > std::numeric_limits<quint32>::max())
+    {
+        return std::nullopt;
+    }
+
+    return static_cast<quint32>(number);
+}
+
+/* An ErrorFilterKey value, or nothing if it is not one. Qt documents QCanBusFrame::FrameErrors, and an integer with the
+ * same bits is accepted as well. */
+static std::optional<QCanBusFrame::FrameErrors> toFrameErrors(QVariant const &value)
+{
+    if (value.userType() == qMetaTypeId<QCanBusFrame::FrameErrors>())
+    {
+        return value.value<QCanBusFrame::FrameErrors>();
+    }
+
+    std::optional<quint32> const number = toUnsigned(value);
+    if (number)
+    {
+        return QCanBusFrame::FrameErrors(QFlag(static_cast<int>(*number)));
+    }
+
+    return std::nullopt;
+}
+
+/* Connection options of a target, without the address. Used for the validation in create() and for every connection,
+ * so both see the same options. The device is always reached at the default port, without mutual TLS. */
+static Connection::Options connectionOptions(CANsub::Target const &target, QString const &deviceId,
+                                             bool acceptAnyDevice)
+{
+    Connection::Options options;
+    options.host = target.host.toUtf8();
+    options.channel = target.channel;
+    options.deviceId = deviceId.toUtf8();
+    options.acceptAnyDevice = acceptAnyDevice;
+    return options;
+}
+
+CANsub *CANsub::create(Target const &target, QString *errorMessage)
+{
+    /* The options of a connection with the default CANsubConfigurationKeyExpectedHostname, see open() */
+    bool const acceptAnyDevice = target.ipv4 && target.deviceId.isEmpty();
+
+    QString error;
+    if (!Connection::validate(connectionOptions(target, target.deviceId, acceptAnyDevice), &error))
+    {
+        if (errorMessage != nullptr)
+        {
+            *errorMessage = tr("Invalid interface name \"%1\": %2").arg(target.interfaceName, error);
+        }
+        return nullptr;
+    }
+
+    return new CANsub(target);
+}
+
+QCanBusDeviceInfo CANsub::createInfo(QString const &hostname, int channel)
+{
+    QString name = hostname;
+
+    /* mDNS names end with a '.', which the user should not see */
+    if (name.endsWith(QLatin1Char('.')))
+    {
+        name.chop(1);
+    }
+
+    QString const interfaceName = QStringLiteral("%1@%2").arg(name, QString::number(channel));
+    QString const serialNumber = name.left(8);
+    QString const description = tr("CANsub device %1, channel %2").arg(serialNumber, QString::number(channel));
+
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+    return QCanBusDevice::createDeviceInfo(QStringLiteral("CANsub"), interfaceName, serialNumber, description,
+                                           QString(), channel, false, true);
+#else
+    return QCanBusDevice::createDeviceInfo(interfaceName, serialNumber, description, channel, false, true);
+#endif
+}
+
+CANsub::CANsub(Target target) :
+    QCanBusDevice(nullptr),
+    target(std::move(target)),
+    settleTimer(new QTimer(this))
+{
+    /* Set default values for all configuration keys. */
     QCanBusDevice::setConfigurationParameter(QCanBusDevice::LoopbackKey, false);
-
-    /* Set the default values for the non-static configuration parameters */
     QCanBusDevice::setConfigurationParameter(QCanBusDevice::CanFdKey, true);
     QCanBusDevice::setConfigurationParameter(QCanBusDevice::ReceiveOwnKey, false);
+    QCanBusDevice::setConfigurationParameter(CANsubConfigurationKeySamplePoint, defaultSamplePoint);
+    QCanBusDevice::setConfigurationParameter(CANsubConfigurationKeyListenOnly, false);
+    QCanBusDevice::setConfigurationParameter(CANsubConfigurationKeyAutoReset, true);
+    QCanBusDevice::setConfigurationParameter(CANsubConfigurationKeyErrorFramesEnabled, false);
+    QCanBusDevice::setConfigurationParameter(CANsubConfigurationKeyUpdateTime, true);
+    QCanBusDevice::setConfigurationParameter(CANsubConfigurationKeyBlockingWrite, false);
 
-    /* Set the default sample point */
-    QCanBusDevice::setConfigurationParameter(CANsubConfigurationKeySamplePoint, 8000);
-
-    /* Set other default values */
-    QCanBusDevice::setConfigurationParameter(
-        CANsubConfigurationKeyListenOnly, CANsubConfigurationKeyListenOnly_default);
-    QCanBusDevice::setConfigurationParameter(CANsubConfigurationKeyAutoReset, CANsubConfigurationKeyAutoReset_default);
-    QCanBusDevice::setConfigurationParameter(
-        CANsubConfigurationKeyErrorFramesEnabled, CANsubConfigurationKeyErrorFramesEnabled_default);
-    QCanBusDevice::setConfigurationParameter(
-        CANsubConfigurationKeyUpdateTime, CANsubConfigurationKeyUpdateTime_default);
-    QCanBusDevice::setConfigurationParameter(
-        CANsubConfigurationKeyBlockingWrite, CANsubConfigurationKeyBlockingWrite_default);
-
-    webSocketCloseTimeoutTimer.setSingleShot(true);
-    connect(&webSocketCloseTimeoutTimer, &QTimer::timeout, this, [this]()
+    /* A connection by IPv4 address verifies the certificate against the device ID of the interface name, or only the
+     * root certificate without one, until the user sets another expected hostname */
+    if (this->target.ipv4)
     {
-        qWarning() << "WebSocket close handshake timed out, aborting connection";
-        QPointer<CANsub> alive(this);
-        webSocket->abort();
-
-        /* Below is a safeguard in case abort does not handle re-setting the state correctly */
-        if (alive && state() == ClosingState)
-        {
-            setState(UnconnectedState);
-        };
-    });
-
-    /* Create and wire the initial transport websocket */
-    createWebSocket();
-
-    /* Connect default signals */
-    connect(&api, &OpenAPI::OAIDefaultApi::apiVersionGetSignal, this, &CANsub::versionCheckSlot);
-    connect(&api, &OpenAPI::OAIDefaultApi::apiVersionGetSignalError, this, &CANsub::versionCheckErrorSlot);
-
-    api.setTimeOut(CANSUB_API_DEFAULT_TIMEOUT_MS);
-}
-
-void CANsub::createWebSocket()
-{
-    /* Dispose of any previous instance. Sever our handlers first, so tearing down the old socket cannot emit into
-     * the device. */
-    if (webSocket != nullptr)
-    {
-        disconnect(webSocket, nullptr, this, nullptr);
-        webSocket->abort();
-        webSocket->deleteLater();
+        QCanBusDevice::setConfigurationParameter(CANsubConfigurationKeyExpectedHostname, this->target.deviceId);
     }
 
-    webSocket = new WebSocket(this);
-
-    connect(webSocket, &WebSocket::disconnected, this, [this]
-    {
-        webSocketCloseTimeoutTimer.stop();
-        bool const wasConnected = (state() == ConnectedState);
-
-        /* setError() may re-enter and delete this device, so update our own state first and emit last */
-        QPointer<CANsub> alive(this);
-        setState(UnconnectedState);
-        if (alive && wasConnected)
-        {
-            setError(QStringLiteral("Connection to remote CANsub device lost"), ConnectionError);
-        }
-    });
-
-    /* Wire the receive handler once for the lifetime of the socket. The connection dies with it on replacement.
-     * The forwarding policy is read from the forwardFd member, which are refreshed from configuration
-     * on every open(). */
-    connect(webSocket, &WebSocket::binaryMessageReceived, this, [this](QByteArray const& data)
-    {
-        wsDataReceived(data);
-    });
-
-    /* The socket is captured explicitly in the handlers below, so they always act on the instance that emitted,
-     * never on a successor. */
-    connect(webSocket, &WebSocket::error, this,
-            [this, socket = webSocket](QAbstractSocket::SocketError error)
-            {
-                qCritical() << "WebSocket error: " << error;
-                recordPendingError(QStringLiteral("WebSocket error: %1").arg(socket->errorString()), QString(), ConnectionError);
-            });
-
-    connect(webSocket, &WebSocket::sslErrors, this, [this, socket = webSocket](const QList<QSslError>& errors)
-    {
-        if (acceptSslErrors(errors))
-        {
-            /* The no-argument overload is used deliberately, as it is the only variant that reaches the in-flight
-             * socket on every supported Qt release, and the check function has already vetted the complete error set of
-             * this handshake. It does latch ignore-everything on this QWebSocket instance for the rest of its life,
-             * which is contained: createWebSocket() gives every connection attempt a fresh instance, so the latch
-             * never outlives the attempt it was vetted for. */
-            socket->ignoreSslErrors();
-        }
-    });
+    settleTimer->setSingleShot(true);
+    settleTimer->setInterval(settleTimeMs);
+    connect(settleTimer, &QTimer::timeout, this, &CANsub::onSettled);
 }
 
 CANsub::~CANsub()
 {
-    /* Sever the websocket handlers first, as closing the socket below can emit synchronously, and those handlers emit
-     * client-visible signals (stateChanged/errorOccurred). */
-    disconnect(webSocket, nullptr, this, nullptr);
+    /* The lookup handlers forget the lookup before they emit anything, so it is never on the stack here */
+    delete lookup;
 
-    /* Close the websocket if open. The instance itself is parented to this device and dies with it. */
-    if (webSocket->isValid())
+    /* Destroys the contexts at once, without emitting anything or calling the handlers of outstanding requests.
+     * This is allowed from within a slot or handler of the connection, e.g. if a client slot deletes the device from
+     * within a signal emitted by the device in onResponse() or onClosed(). */
+    qDeleteAll(closingConnections);
+    delete connection;
+}
+
+void CANsub::setConfigurationParameter(ConfigurationKeyType key, QVariant const &value)
+{
+    bool valid = false;
+    QString expected;
+
+    switch (keyValue(key))
     {
-        webSocket->close();
-
-        /* NOTE: It may be that an abort is necessary here. Kept for reference. */
-        //webSocket->abort();
+    case keyValue(QCanBusDevice::LoopbackKey):
+    {
+        if (value.isValid() && value.canConvert<bool>() && !value.toBool())
+        {
+            return;
+        }
+        qCWarning(lcCansub) << "LoopbackKey is fixed to false, as the CANsub device has no loopback. Ignoring" << value;
+        return;
+    }
+    case keyValue(QCanBusDevice::RawFilterKey):
+    {
+        qCWarning(lcCansub) << "RawFilterKey is not supported, as the CANsub plugin does not filter frames. Ignoring"
+                            << value;
+        return;
+    }
+    case keyValue(CANsubConfigurationKeyDisableCertificateValidation):
+    {
+        qCWarning(lcCansub).noquote() << keyName(key) << "is deprecated and has no effect.";
+        return;
+    }
+    case keyValue(CANsubConfigurationKeyExpectedHostname):
+    {
+        /* The CANsub library verifies the certificate against a device ID, so only names it can be derived from are
+         * accepted. An empty name only verifies the root certificate. */
+        valid = value.canConvert<QString>()
+                && (value.toString().isEmpty() || expectedDeviceId(value.toString()).has_value());
+        expected = tr("a device ID (8 hex digits), a device hostname (<device ID>-usb.local or <device ID>-eth.local) "
+                      "or an empty string");
+        break;
+    }
+    case keyValue(QCanBusDevice::CanFdKey):
+    {
+        valid = value.canConvert<bool>();
+        expected = tr("a boolean");
+        if (valid && !value.toBool())
+        {
+            qCWarning(lcCansub) << "The CANsub device always runs CAN FD. With CanFdKey false, CAN FD frames are "
+                                   "dropped on receive and rejected on transmit.";
+        }
+        break;
+    }
+    case keyValue(QCanBusDevice::ReceiveOwnKey):
+    case keyValue(CANsubConfigurationKeyListenOnly):
+    case keyValue(CANsubConfigurationKeyAutoReset):
+    case keyValue(CANsubConfigurationKeyErrorFramesEnabled):
+    case keyValue(CANsubConfigurationKeyUpdateTime):
+    case keyValue(CANsubConfigurationKeyBlockingWrite):
+    {
+        valid = value.canConvert<bool>();
+        expected = tr("a boolean");
+        break;
+    }
+    case keyValue(QCanBusDevice::BitRateKey):
+    case keyValue(QCanBusDevice::DataBitRateKey):
+    {
+        valid = toUnsigned(value).has_value();
+        expected = tr("a bit rate in bit/s (unsigned integer)");
+        break;
+    }
+    case keyValue(CANsubConfigurationKeySamplePoint):
+    {
+        std::optional<quint32> const samplePoint = toUnsigned(value);
+        valid = samplePoint.has_value() && (*samplePoint <= maximumSamplePoint);
+        expected = tr("a sample point in 0.01 % from 0 to 10000 (unsigned integer)");
+        break;
+    }
+    case keyValue(CANsubConfigurationKeyBitTiming):
+    case keyValue(CANsubConfigurationKeyBitTimingData):
+    {
+        valid = value.canConvert<BitTiming>();
+        expected = tr("a CANsubQt::BitTiming");
+        break;
+    }
+    case keyValue(QCanBusDevice::ErrorFilterKey):
+    {
+        valid = toFrameErrors(value).has_value();
+        expected = tr("QCanBusFrame::FrameErrors");
+        break;
+    }
+    default:
+    {
+        QCanBusDevice::setConfigurationParameter(key, value);
+        return;
+    }
     }
 
-    /* Abort any pending request via the OpenAPI wrapper */
-    api.abortRequests();
-
-    /* Ensure to also stop and delete the statemachine if it is present */
-    if (connectionStateMachine)
+    /* An invalid QVariant clears the key, as in QCanBusDevice */
+    if (value.isValid() && !valid)
     {
-        connectionStateMachine->stop();
-        stateMachineDestroy();
+        QString const message = tr("Invalid value \"%1\" of type %2 for the configuration key %3. Expected %4.")
+                                .arg(value.toString(), QString::fromLatin1(value.typeName()), keyName(key), expected);
+        qCWarning(lcCansub).noquote() << message;
+        setError(message, ConfigurationError);
+        return;
+    }
+
+    QCanBusDevice::setConfigurationParameter(key, value);
+
+    /* The keys handled here are only read by open() */
+    if (state() != UnconnectedState)
+    {
+        qCInfo(lcCansub).noquote() << keyName(key) << "changed while connected. It takes effect on the next connect.";
     }
 }
 
-QCanBusDeviceInfo CANsub::createInfo(const QString& hostname, int channel)
+bool CANsub::boolParameter(ConfigurationKeyType key, bool fallback) const
 {
-    /* We need to bastardize the name attribute, since we need to encode both the device address and the channel in one
-     * variable, which is also used as an identifier in the GUIs. */
-
-    const QString pluginName = QStringLiteral("CANsub");
-    const QString serialNumber = hostname.left(8);
-    const QString description = QString("CANsub Device %1 Channel %2").arg(serialNumber).arg(channel);
-
-    QString interfaceName = hostname;
-
-    /* The hostname we receive from mDNS lookup has a trailing ".". Remove it when presenting it to the end user. */
-    if (interfaceName.endsWith("."))
+    QVariant const value = configurationParameter(key);
+    if (!value.isValid())
     {
-        interfaceName.truncate(interfaceName.lastIndexOf("."));
+        return fallback;
     }
-    interfaceName.append(QString("@%1").arg(QString::number(channel)));
 
-#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
-    return QCanBusDevice::createDeviceInfo(
-        pluginName,
-        interfaceName,
-        serialNumber,
-        description,
-        QString(),
-        channel,
-        false,
-        true
-        );
-#else
-    return QCanBusDevice::createDeviceInfo(
-        interfaceName,
-        serialNumber,
-        description,
-        channel,
-        false,
-        true
-        );
-#endif
+    return value.toBool();
+}
+
+/* JSON object of one bit timing phase for the PHY request. */
+/* A sample point in 0.01 % as a percentage for messages, e.g. "81.5". */
+static QString samplePointText(quint32 samplePoint)
+{
+    return QString::number(samplePoint / 100.0);
+}
+
+std::optional<QByteArray> CANsub::buildPhyConfiguration(QString *errorMessage) const
+{
+    Q_ASSERT(errorMessage != nullptr);
+
+    Rest::PhyConfig phy;
+
+    QVariant const bitTiming = configurationParameter(CANsubConfigurationKeyBitTiming);
+    QVariant const bitTimingData = configurationParameter(CANsubConfigurationKeyBitTimingData);
+    if (bitTiming.isValid() && bitTimingData.isValid())
+    {
+        BitTiming const nominal = bitTiming.value<BitTiming>();
+        BitTiming const data = bitTimingData.value<BitTiming>();
+        phy.timing = {nominal.brp, nominal.tseg1, nominal.tseg2, nominal.sjw};
+        phy.timingData = {data.brp, data.tseg1, data.tseg2, data.sjw};
+    }
+    else
+    {
+        if (bitTiming.isValid() || bitTimingData.isValid())
+        {
+            qCWarning(lcCansub) << "Only one of the bit timing keys is set, so the bit timing is calculated from the "
+                                   "bit rates. Set both CANsubConfigurationKeyBitTiming and "
+                                   "CANsubConfigurationKeyBitTimingData to use them.";
+        }
+
+        std::optional<quint32> const nominalBitRate = toUnsigned(configurationParameter(QCanBusDevice::BitRateKey));
+        if (!nominalBitRate)
+        {
+            *errorMessage = tr("No bit rate is configured for %1. Set the BitRateKey (and optionally the "
+                               "DataBitRateKey), or both CANsub bit timing keys.").arg(target.interfaceName);
+            return std::nullopt;
+        }
+
+        std::optional<quint32> const configuredDataBitRate =
+            toUnsigned(configurationParameter(QCanBusDevice::DataBitRateKey));
+        quint32 const dataBitRate = configuredDataBitRate.has_value()
+                                        ? *configuredDataBitRate
+                                        : std::max(minimumDefaultDataBitRate, *nominalBitRate);
+
+        std::optional<quint32> const configuredSamplePoint =
+            toUnsigned(configurationParameter(CANsubConfigurationKeySamplePoint));
+        quint32 const samplePoint = configuredSamplePoint.value_or(defaultSamplePoint);
+
+        cansub_bittiming calculated{};
+        cansub_result const result = cansub_calculate_bittiming(&calculated, *nominalBitRate, samplePoint, dataBitRate,
+                                                                samplePoint);
+        if (result == CANSUB_RESULT_NOT_FOUND)
+        {
+            *errorMessage = tr("No bit timing of the CANsub device matches a nominal bit rate of %1 bit/s and a data "
+                               "bit rate of %2 bit/s with a sample point of %3 %.")
+                            .arg(QString::number(*nominalBitRate), QString::number(dataBitRate),
+                                 samplePointText(samplePoint));
+            return std::nullopt;
+        }
+        if (result != CANSUB_RESULT_OK)
+        {
+            *errorMessage = tr("The nominal bit rate of %1 bit/s, the data bit rate of %2 bit/s or the sample point of "
+                               "%3 % is invalid. The bit rates must be above 0, the data bit rate must be at least the "
+                               "nominal bit rate and the sample point must be at most 100 %.")
+                            .arg(QString::number(*nominalBitRate), QString::number(dataBitRate),
+                                 samplePointText(samplePoint));
+            return std::nullopt;
+        }
+
+        phy.timing = {calculated.nominal.brp, calculated.nominal.seg1, calculated.nominal.seg2, calculated.nominal.sjw};
+        phy.timingData = {calculated.data.brp, calculated.data.seg1, calculated.data.seg2, calculated.data.sjw};
+    }
+
+    phy.listenOnly = boolParameter(CANsubConfigurationKeyListenOnly, false);
+    phy.autoReset = boolParameter(CANsubConfigurationKeyAutoReset, true);
+    phy.errorFrames = boolParameter(CANsubConfigurationKeyErrorFramesEnabled, false);
+    phy.txAckFrames = boolParameter(QCanBusDevice::ReceiveOwnKey, false);
+
+    return Rest::phyBody(phy);
 }
 
 bool CANsub::open()
 {
-    /* Clear the internal error trackers and state */
+    /* close() and every failure end the connect before the device becomes unconnected */
+    Q_ASSERT(step == Step::Idle);
+    Q_ASSERT(lookup == nullptr);
+    Q_ASSERT(connection == nullptr);
+
     clearError();
-    pendingErrorCode = NoError;
-    pendingErrorString.clear();
-    bufferRx.clear();
 
-    qDebug() << "Starting connection attempt";
-
-    /* Some Windows builds of the Qt framework, e.g. the ones shipped with SavvyCAN and PlotJuggler, does not
-     * support TLS */
-    if (!QSslSocket::supportsSsl())
+    QString errorMessage;
+    std::optional<QByteArray> const phy = buildPhyConfiguration(&errorMessage);
+    if (!phy)
     {
-        pendingErrorString = "TLS/SSL support is missing on this platform, cannot connect to CANsub device";
-        pendingErrorCode = ConnectionError;
-        qCritical() << pendingErrorString;
-        abortOpen();
+        qCWarning(lcCansub).noquote() << errorMessage;
+        setError(errorMessage, ConfigurationError);
         return false;
     }
+    phyConfiguration = *phy;
 
-    if (this->connectionStateMachine != nullptr)
+    session = Session();
+    if (target.ipv4)
     {
-        /* Connection attempt already in progress */
-        qWarning() << "Attempting to connect while already connecting";
-        return true;
+        /* setConfigurationParameter() only accepts values expectedDeviceId() can map, or an empty one */
+        QVariant const expectedHostname = configurationParameter(CANsubConfigurationKeyExpectedHostname);
+        session.deviceId = expectedDeviceId(expectedHostname.toString()).value_or(QString());
+        session.acceptAnyDevice = session.deviceId.isEmpty();
     }
-    /* NOTE: We do not check for ConnectedState/ClosingState, as this already should have been handled by the Qt
-     *       framework. */
+    session.canFd = boolParameter(QCanBusDevice::CanFdKey, true);
+    session.receiveOwn = boolParameter(QCanBusDevice::ReceiveOwnKey, false);
+    session.errorFrames = boolParameter(CANsubConfigurationKeyErrorFramesEnabled, false);
+    session.blockingWrite = boolParameter(CANsubConfigurationKeyBlockingWrite, false);
+    session.updateTime = boolParameter(CANsubConfigurationKeyUpdateTime, true);
+    session.errorFilter = toFrameErrors(configurationParameter(QCanBusDevice::ErrorFilterKey));
 
-    /* Resolve how the remote's TLS identity should be verified before we start talking to it. */
-    if (!resolveTlsPolicy())
-    {
-        abortOpen();
-        return false;
-    }
+    qCInfo(lcCansub).noquote() << "Connecting to" << target.interfaceName;
 
-    /* Never reuse the previous attempt's websocket. Replace it with a freshly wired instance so no TLS-ignore
-     * state can leak between attempts. The state-machine transitions below bind to the new instance. */
-    createWebSocket();
-
-    /* We handle the entire connection sequence via a state machine, as there is a lot of communication back and forth
-     * with the CANsub remote, and the latency may be too long to handle without handing control back to the control
-     * loop.
-     * NOTE: The state storage can reside as a stack allocated struct here, since it only stores pointers and all the
-     *       state pointers will have the state machine as parent, thus having a life-time identical to the state
-     *       machine. */
-    connectionStateMachine = new QStateMachine(this);
-    auto connectionStates = allocateStates(connectionStateMachine);
-
-    configureLookupState(connectionStates);
-    configureGetVersionState(connectionStates);
-    configureGetTimeState(connectionStates);
-    configureSetTimeState(connectionStates);
-    if (!configureSetBusPhyState(connectionStates))
-    {
-        abortOpen();
-        return false;
-    }
-    configureGetBusFiltersState(connectionStates);
-    configureSetBusFiltersState(connectionStates);
-    configureOpenWebsocketState(connectionStates);
-    configureTerminalStates(connectionStates);
-
-    connectionStateMachine->setInitialState(connectionStates.lookupHost);
-    qDebug() << "Starting state machine";
-    connectionStateMachine->start();
-
+    enterStep(Step::Lookup);
     return true;
+}
+
+void CANsub::enterStep(Step next)
+{
+    step = next;
+
+    /* NOTE: Signal results are forwarded to functions instead of being inlined as lambdas to improve readability. */
+
+    switch (next)
+    {
+    case Step::Idle:
+    {
+        break;
+    }
+    case Step::Lookup:
+    {
+        HostLookup *const started = new HostLookup(target.host);
+        lookup = started;
+        connect(started, &HostLookup::resolved, this, [this, started](QHostAddress const &address)
+        {
+            onLookupResolved(started, address);
+        });
+        connect(started, &HostLookup::failed, this, [this, started](QString const &message)
+        {
+            onLookupFailed(started, message);
+        });
+        started->start(lookupTimeoutMs);
+        break;
+    }
+    case Step::WaitForClosing:
+    {
+        /* onRetiredClosed() continues with the Version step */
+        qCDebug(lcCansub) << "Waiting for" << closingConnections.size() << "earlier connections to close";
+        break;
+    }
+    case Step::Version:
+    {
+        Q_ASSERT(connection == nullptr);
+        Q_ASSERT(closingConnections.isEmpty());
+
+        Connection::Options options = connectionOptions(target, session.deviceId, session.acceptAnyDevice);
+        options.address = QHostAddress(resolvedAddress);
+
+        QString errorMessage;
+        Connection *const created = Connection::create(options, nullptr, &errorMessage);
+        if (created == nullptr)
+        {
+            failOpen(tr("Connecting to %1 failed: %2").arg(target.interfaceName, errorMessage), ConnectionError);
+            break;
+        }
+
+        connection = created;
+        connect(created, &Connection::opened, this, [this, created]()
+        {
+            onOpened(created);
+        });
+        connect(created, &Connection::framesReceived, this, [this, created](QVector<cansub_frame> const &frames)
+        {
+            onFramesReceived(created, frames);
+        });
+        connect(created, &Connection::closed, this, [this, created](cansub_result error, QString const &message)
+        {
+            onClosed(created, error, message);
+        });
+
+        /* The API version is checked before any other request, see the API conventions in cansub_ffi.h */
+        sendRequest("GET", Rest::versionPath, QByteArray());
+        break;
+    }
+    case Step::PtpStatus:
+    {
+        sendRequest("GET", Rest::ptpPath, QByteArray());
+        break;
+    }
+    case Step::GetTime:
+    {
+        sendRequest("GET", Rest::timePath, QByteArray());
+        break;
+    }
+    case Step::SetTime:
+    {
+        sendRequest("PUT", Rest::timePath, Rest::timeBody(QDateTime::currentDateTimeUtc()));
+        break;
+    }
+    case Step::SetPhy:
+    {
+        sendRequest("PUT", Rest::phyPath(target.channel), phyConfiguration);
+        break;
+    }
+    case Step::GetFilters:
+    {
+        sendRequest("GET", Rest::filterPath(target.channel), QByteArray());
+        break;
+    }
+    case Step::DeleteFilters:
+    {
+        if (filtersToDelete.isEmpty())
+        {
+            enterStep(Step::AddStandardFilter);
+            break;
+        }
+
+        sendRequest("DELETE", Rest::filterPath(target.channel, filtersToDelete.first()), QByteArray());
+        break;
+    }
+    case Step::AddStandardFilter:
+    {
+        sendRequest("POST", Rest::filterPath(target.channel), Rest::acceptAllFilterBody(false));
+        break;
+    }
+    case Step::AddExtendedFilter:
+    {
+        sendRequest("POST", Rest::filterPath(target.channel), Rest::acceptAllFilterBody(true));
+        break;
+    }
+    case Step::OpenData:
+    {
+        /* onOpened() continues with the Settle step */
+        if (!connection->open())
+        {
+            failOpen(tr("Opening the data stream of CAN channel %1 of %2 failed.")
+                     .arg(QString::number(target.channel), target.host), ConnectionError);
+        }
+        break;
+    }
+    case Step::Settle:
+    {
+        /* onSettled() called from the settleTimer continues with the Connected step */
+        qCDebug(lcCansub) << "Data stream open, settling";
+        settleTimer->start();
+        break;
+    }
+    case Step::Connected:
+    {
+        qCInfo(lcCansub).noquote() << "Connected to" << target.interfaceName;
+        setState(ConnectedState);
+        break;
+    }
+    }
+}
+
+void CANsub::sendRequest(QByteArray const &method, QByteArray const &path, QByteArray const &body)
+{
+    Q_ASSERT(connection != nullptr);
+
+    qCDebug(lcCansub) << method << path << body;
+
+    /* The answer belongs to this step and this connection, see onResponse() */
+    Connection *const source = connection;
+    Step const requestStep = step;
+    connection->request(method, path, body, [this, source, requestStep](Response const &response)
+    {
+        onResponse(source, requestStep, response.result, response.httpStatus, response.body);
+    });
+}
+
+/* Message for a failed request: The step, the channel and either the transport error or the HTTP status and body. */
+static QString requestFailureMessage(QString const &step, quint32 channel, qint32 result, quint32 httpStatus,
+                                     QByteArray const &body)
+{
+    if (result < 0)
+    {
+        return CANsub::tr("%1 failed for CAN channel %2: %3")
+               .arg(step, QString::number(channel), resultDescription(result));
+    }
+
+    QString const text = QString::fromUtf8(body).trimmed();
+    if (text.isEmpty())
+    {
+        return CANsub::tr("%1 failed for CAN channel %2 with HTTP status %3.")
+               .arg(step, QString::number(channel), QString::number(httpStatus));
+    }
+
+    return CANsub::tr("%1 failed for CAN channel %2 with HTTP status %3: %4")
+           .arg(step, QString::number(channel), QString::number(httpStatus), text);
+}
+
+QString CANsub::requestDescription() const
+{
+    switch (step)
+    {
+    case Step::Version:
+    {
+        return tr("Version query");
+    }
+    case Step::PtpStatus:
+    {
+        return tr("Reading the PTP status of the device");
+    }
+    case Step::GetTime:
+    {
+        return tr("Reading the time of the device");
+    }
+    case Step::SetTime:
+    {
+        return tr("Setting the time of the device");
+    }
+    case Step::SetPhy:
+    {
+        return tr("Configuring the CAN bus");
+    }
+    case Step::GetFilters:
+    {
+        return tr("Reading the CAN filters");
+    }
+    case Step::DeleteFilters:
+    {
+        return tr("Removing CAN filter %1").arg(filtersToDelete.first());
+    }
+    case Step::AddStandardFilter:
+    {
+        return tr("Adding the accept-all filter for standard IDs");
+    }
+    case Step::AddExtendedFilter:
+    {
+        return tr("Adding the accept-all filter for extended IDs");
+    }
+    case Step::Idle:
+    case Step::Lookup:
+    case Step::WaitForClosing:
+    case Step::OpenData:
+    case Step::Settle:
+    case Step::Connected:
+    {
+        break;
+    }
+    }
+
+    /* No request is sent in the other steps */
+    Q_ASSERT(false);
+    return tr("A request");
+}
+
+void CANsub::onResponse(Connection *source, Step requestStep, qint32 result, quint32 httpStatus,
+                        QByteArray const &body)
+{
+    /* Answers for a retired connection or an earlier connect are dropped. Only one request is outstanding at a time. */
+    if ((source != connection) || (requestStep != step))
+    {
+        return;
+    }
+
+    qCDebug(lcCansub) << "Response" << result << httpStatus << body;
+
+    /* A transport failure ends every step the same way */
+    if (result < 0)
+    {
+        failOpen(requestFailureMessage(requestDescription(), target.channel, result, httpStatus, body),
+                 ConnectionError);
+        return;
+    }
+
+    switch (step)
+    {
+    case Step::Version:
+    {
+        if (httpStatus != 200)
+        {
+            failOpen(requestFailureMessage(requestDescription(), target.channel, result, httpStatus, body),
+                     ConnectionError);
+            return;
+        }
+
+        quint32 remote = 0;
+        cansub_result const check = cansub_api_version_check(body.constData(), static_cast<size_t>(body.size()),
+                                                              &remote);
+        if (check == CANSUB_RESULT_NOT_SUPPORTED)
+        {
+            QString const version = QStringLiteral("%1.%2").arg(remote >> 16, 2, 10, QLatin1Char('0'))
+                                    .arg(remote & 0xFFFFu, 2, 10, QLatin1Char('0'));
+            failOpen(tr("The device %1 uses the API version %2, which this plugin does not support")
+                .arg(target.host, version), ConnectionError);
+            return;
+        }
+        if (check != CANSUB_RESULT_OK)
+        {
+            failOpen(tr("The device %1 answered the API version request with the unexpected version \"%2\".")
+                     .arg(target.host, QString::fromUtf8(body).trimmed()), ConnectionError);
+            return;
+        }
+
+        if (session.updateTime)
+        {
+            enterStep(Step::PtpStatus);
+        }
+        else
+        {
+            enterStep(Step::SetPhy);
+        }
+        return;
+    }
+    case Step::PtpStatus:
+    {
+        /* Setting the time disables PTP on the device for the rest of its power cycle, so the time of a device that
+         * tracks a PTP master is left alone. Any other answer falls back to the time comparison. */
+        std::optional<QString> const ptpState = (httpStatus == 200) ? Rest::parsePtpState(body) : std::nullopt;
+        if (ptpState == QLatin1String("tracking"))
+        {
+            qCDebug(lcCansub) << "Not setting the device time, as it tracks a PTP master";
+            enterStep(Step::SetPhy);
+        }
+        else
+        {
+            qCDebug(lcCansub).noquote() << "PTP status" << httpStatus << ptpState.value_or(QStringLiteral("unknown"))
+                                        << "- comparing the device time";
+            enterStep(Step::GetTime);
+        }
+        return;
+    }
+    case Step::GetTime:
+    {
+        if (httpStatus != 200)
+        {
+            failOpen(requestFailureMessage(requestDescription(), target.channel, result, httpStatus, body),
+                     ConnectionError);
+            return;
+        }
+
+        /* An unreadable device time is set like a wrong one */
+        std::optional<QDateTime> const deviceTime = Rest::parseTime(body);
+        QDateTime const now = QDateTime::currentDateTimeUtc();
+        if (deviceTime && (qAbs(deviceTime->msecsTo(now)) < timeToleranceMs))
+        {
+            enterStep(Step::SetPhy);
+        }
+        else
+        {
+            qCInfo(lcCansub).noquote() << "Setting the device time, as it is"
+                                       << (deviceTime ? deviceTime->toString(Qt::ISODateWithMs)
+                                                      : QStringLiteral("unreadable"))
+                                       << "and the local time is" << now.toString(Qt::ISODateWithMs);
+            enterStep(Step::SetTime);
+        }
+        return;
+    }
+    case Step::SetTime:
+    {
+        if (httpStatus != 200)
+        {
+            failOpen(requestFailureMessage(requestDescription(), target.channel, result, httpStatus, body),
+                     ConnectionError);
+            return;
+        }
+
+        enterStep(Step::SetPhy);
+        return;
+    }
+    case Step::SetPhy:
+    {
+        if (httpStatus == 200)
+        {
+            enterStep(Step::GetFilters);
+            return;
+        }
+
+        QString const failure = requestFailureMessage(requestDescription(), target.channel, result, httpStatus, body);
+        if (httpStatus == 500)
+        {
+            failOpen(tr("CAN channel %1 of %2 is in use by another client (the device rejected the PHY "
+                        "configuration while the channel is open). %3")
+                     .arg(QString::number(target.channel), target.host, failure), ConfigurationError);
+        }
+        else if (httpStatus == 404)
+        {
+            failOpen(tr("The device %1 has no CAN channel %2. %3")
+                     .arg(target.host, QString::number(target.channel), failure), ConfigurationError);
+        }
+        else
+        {
+            failOpen(failure, ConfigurationError);
+        }
+        return;
+    }
+    case Step::GetFilters:
+    {
+        if (httpStatus != 200)
+        {
+            failOpen(requestFailureMessage(requestDescription(), target.channel, result, httpStatus, body),
+                     ConfigurationError);
+            return;
+        }
+
+        std::optional<QList<quint32>> const filterIds = Rest::parseFilterIds(body);
+        if (!filterIds)
+        {
+            failOpen(tr("The device %1 answered the filter request of CAN channel %2 with an unexpected response.")
+                     .arg(target.host, QString::number(target.channel)), ConfigurationError);
+            return;
+        }
+
+        /* Whatever another client left behind is replaced by the two accept-all filters, as the plugin does not
+         * filter frames */
+        filtersToDelete = *filterIds;
+        enterStep(Step::DeleteFilters);
+        return;
+    }
+    case Step::DeleteFilters:
+    {
+        /* A filter removed in the meantime is fine */
+        if ((httpStatus != 200) && (httpStatus != 404))
+        {
+            failOpen(requestFailureMessage(requestDescription(), target.channel, result, httpStatus, body),
+                     ConfigurationError);
+            return;
+        }
+
+        filtersToDelete.removeFirst();
+        enterStep(Step::DeleteFilters);
+        return;
+    }
+    case Step::AddStandardFilter:
+    {
+        if (httpStatus != 201)
+        {
+            failOpen(requestFailureMessage(requestDescription(), target.channel, result, httpStatus, body),
+                     ConfigurationError);
+            return;
+        }
+
+        enterStep(Step::AddExtendedFilter);
+        return;
+    }
+    case Step::AddExtendedFilter:
+    {
+        if (httpStatus != 201)
+        {
+            failOpen(requestFailureMessage(requestDescription(), target.channel, result, httpStatus, body),
+                     ConfigurationError);
+            return;
+        }
+
+        enterStep(Step::OpenData);
+        return;
+    }
+    case Step::Idle:
+    case Step::Lookup:
+    case Step::WaitForClosing:
+    case Step::OpenData:
+    case Step::Settle:
+    case Step::Connected:
+    {
+        /* No request is sent in these steps */
+        Q_ASSERT(false);
+        return;
+    }
+    }
+}
+
+void CANsub::onLookupResolved(HostLookup *source, QHostAddress const &address)
+{
+    if ((source != lookup) || (step != Step::Lookup))
+    {
+        return;
+    }
+    lookup = nullptr;
+    source->deleteLater();
+
+    qCDebug(lcCansub).noquote() << target.host << "resolved to" << address.toString();
+    resolvedAddress = address.toIPv4Address();
+
+    if (closingConnections.isEmpty())
+    {
+        enterStep(Step::Version);
+    }
+    else
+    {
+        enterStep(Step::WaitForClosing);
+    }
+}
+
+void CANsub::onLookupFailed(HostLookup *source, QString const &message)
+{
+    if ((source != lookup) || (step != Step::Lookup))
+    {
+        return;
+    }
+    lookup = nullptr;
+    source->deleteLater();
+
+    failOpen(message, ConnectionError);
+}
+
+void CANsub::failOpen(QString const &message, CanBusError errorCode)
+{
+    /* The lookup is only set in the Lookup step, and its handlers forget it before they fail */
+    Q_ASSERT(lookup == nullptr);
+
+    qCWarning(lcCansub).noquote() << message;
+
+    /* End the connect first, as the client may react to the error, e.g. with a new connect. A connection finishes its
+     * close in the background. */
+    step = Step::Idle;
+    filtersToDelete.clear();
+    if (connection != nullptr)
+    {
+        retireConnection();
+    }
+
+    QPointer<CANsub> alive(this);
+    setError(message, errorCode);
+    if (alive)
+    {
+        setState(UnconnectedState);
+    }
+}
+
+void CANsub::retireConnection()
+{
+    Q_ASSERT(connection != nullptr);
+
+    Connection *const retired = connection;
+    connection = nullptr;
+    settleTimer->stop();
+
+    /* Only the end of the close matters now. It has not been emitted yet, as the connection is still current. */
+    disconnect(retired, nullptr, this, nullptr);
+    closingConnections.append(retired);
+    connect(retired, &Connection::closed, this, [this, retired]()
+    {
+        onRetiredClosed(retired);
+    });
+
+    retired->close();
+}
+
+void CANsub::onRetiredClosed(Connection *source)
+{
+    if (!closingConnections.removeOne(source))
+    {
+        return;
+    }
+
+    /* Allowed from within its own signal, see Connection */
+    delete source;
+
+    qCDebug(lcCansub) << "Earlier connection closed," << closingConnections.size() << "still closing";
+
+    /* A connect waiting for the earlier connections to close continues now */
+    if (closingConnections.isEmpty() && (step == Step::WaitForClosing))
+    {
+        enterStep(Step::Version);
+    }
+}
+
+void CANsub::onOpened(Connection *source)
+{
+    if ((source != connection) || (step != Step::OpenData))
+    {
+        return;
+    }
+
+    enterStep(Step::Settle);
+}
+
+void CANsub::onSettled()
+{
+    if (step != Step::Settle)
+    {
+        return;
+    }
+
+    enterStep(Step::Connected);
+}
+
+void CANsub::onFramesReceived(Connection *source, QVector<cansub_frame> const &frames)
+{
+    /* Frames of the settle window are dropped */
+    if ((source != connection) || (step != Step::Connected))
+    {
+        return;
+    }
+
+    QVector<QCanBusFrame> received;
+    received.reserve(frames.size());
+
+    for (cansub_frame const &in : frames)
+    {
+        std::optional<QCanBusFrame> const frame = fromCansubFrame(in);
+        if (!frame)
+        {
+            continue;
+        }
+
+        /* Transmit acknowledgements */
+        if (frame->hasLocalEcho() && !session.receiveOwn)
+        {
+            continue;
+        }
+
+        if (frame->frameType() == QCanBusFrame::ErrorFrame)
+        {
+            /* The device only sends error frames if enabled. Never pass one on otherwise. */
+            if (!session.errorFrames)
+            {
+                continue;
+            }
+            if (session.errorFilter && !(frame->error() & *session.errorFilter))
+            {
+                continue;
+            }
+        }
+        else if (frame->hasFlexibleDataRateFormat() && !session.canFd)
+        {
+            continue;
+        }
+
+        received.append(*frame);
+    }
+
+    if (!received.isEmpty())
+    {
+        enqueueReceivedFrames(received);
+    }
+}
+
+void CANsub::onClosed(Connection *source, qint32 error, QString const &message)
+{
+    if (source != connection)
+    {
+        return;
+    }
+
+    /* The current connection only closes by itself, as close() and failures retire it first. Forget it before
+     * emitting anything. Deleting it is allowed from within its own signal, see Connection. */
+    bool const wasConnected = (step == Step::Connected);
+    step = Step::Idle;
+    filtersToDelete.clear();
+    settleTimer->stop();
+    connection = nullptr;
+    delete source;
+
+    /* The message of the connection already holds the translated reason */
+    QString text = message;
+    if (text.isEmpty() && wasConnected)
+    {
+        text = tr("The device closed the connection to %1.").arg(target.interfaceName);
+    }
+    else if (text.isEmpty())
+    {
+        text = tr("Connecting to %1 failed: The device closed the connection.").arg(target.interfaceName);
+    }
+
+    qCWarning(lcCansub).noquote() << text << "(result" << error << ")";
+
+    QPointer<CANsub> alive(this);
+    setError(text, ConnectionError);
+    if (alive)
+    {
+        setState(UnconnectedState);
+    }
 }
 
 void CANsub::close()
 {
-    clearError();
+    /* Qt expects UnconnectedState at once. A connection finishes its close in the background, and a following open()
+     * waits for it in the WaitForClosing step. */
+    step = Step::Idle;
+    filtersToDelete.clear();
 
-    /* Disconnect the websocket to close the bus and abort any in-flight requests */
-    api.abortRequests();
-    if (webSocket->state() == QAbstractSocket::ConnectedState)
+    if (lookup != nullptr)
     {
-        webSocket->close();
-    }
-    else if (webSocket->state() == QAbstractSocket::ConnectingState)
-    {
-        webSocket->abort();
-    }
-
-    /* We may have closed the bus without ever opening the websocket. If it is already closed, mark the CAN bus as
-     * closed. */
-    if (webSocket->state() == QAbstractSocket::UnconnectedState)
-    {
-        setState(UnconnectedState);
-    }
-    else
-    {
-        webSocketCloseTimeoutTimer.start(closeHandshakeTimeoutMs);
+        lookup->abort();
+        delete lookup;
+        lookup = nullptr;
     }
 
-    /* Ensure to also stop and delete the statemachine if it is present */
-    if (connectionStateMachine)
+    if (connection != nullptr)
     {
-        connectionStateMachine->stop();
-        stateMachineDestroy();
+        retireConnection();
     }
+
+    qCInfo(lcCansub).noquote() << "Disconnected from" << target.interfaceName;
+    setState(UnconnectedState);
 }
 
-QString CANsub::interpretErrorFrame(const QCanBusFrame& errorFrame)
+bool CANsub::writeFrame(QCanBusFrame const &frame)
 {
-    QString result;
-
-    if (errorFrame.frameType() == QCanBusFrame::ErrorFrame)
+    if (state() != ConnectedState)
     {
-        auto const errorType = errorFrame.error();
-
-        if (errorType & QCanBusFrame::FrameError::TransmissionTimeoutError)
-        {
-            result += "Failed to transmit requested frame.\n";
-        }
-        if (errorType & QCanBusFrame::FrameError::LostArbitrationError)
-        {
-            result += "Lost CAN bus arbitration during frame transmission.\n";
-        }
-        if (errorType & QCanBusFrame::FrameError::ControllerError)
-        {
-            result += "Remote CAN controller error.\n";
-        }
-        if (errorType & QCanBusFrame::FrameError::ProtocolViolationError)
-        {
-            result += "CAN protocol violation error.\n";
-        }
-        if (errorType & QCanBusFrame::FrameError::TransceiverError)
-        {
-            result += "Failed to write requested payload.\n";
-        }
-        if (errorType & QCanBusFrame::FrameError::MissingAcknowledgmentError)
-        {
-            result += "Frame was not acknowledged on the CAN bus.\n";
-        }
-        if (errorType & QCanBusFrame::FrameError::BusOffError)
-        {
-            result += "CAN bus is offline.\n";
-        }
-        if (errorType & QCanBusFrame::FrameError::BusError)
-        {
-            result += "An error occurred on the CAN bus.\n";
-        }
-        if (errorType & QCanBusFrame::FrameError::ControllerRestartError)
-        {
-            result += "The remote CAN controller has restarted.\n";
-        }
-        if (errorType & QCanBusFrame::FrameError::UnknownError)
-        {
-            result += "Unknown error.\n";
-        }
-
-        if (!result.isEmpty())
-        {
-            result.prepend("The following errors occurred:\n");
-        }
-    }
-
-    return result;
-}
-
-template <typename T>
-bool CANsub::configurationHelperForwardIfValid(CANBUS_CONFIGURATION_KEY key, QVariant const& value)
-{
-    if ((value.isValid() && value.canConvert<T>()) || !value.isValid())
-    {
-        /* Forward to the base class */
-        QCanBusDevice::setConfigurationParameter(key, value);
-        return true;
-    }
-
-    return false;
-}
-
-void CANsub::setConfigurationParameter(CANBUS_CONFIGURATION_KEY key, const QVariant& value)
-{
-    switch (key)
-    {
-        case QCanBusDevice::ConfigurationKey::LoopbackKey:
-        {
-            /* The device will never be able to perform loopback, so this option cannot be set. */
-            qWarning() << "Attempting to set fixed key LoopbackKey with value" << value.toString()
-                << ". Value is fixed to false";
-            break;
-        }
-        case QCanBusDevice::ConfigurationKey::CanFdKey:
-        {
-            if (value.isValid() && value.canConvert<bool>())
-            {
-                if (!value.value<bool>())
-                {
-                    qWarning() <<
-                        "Attempting to disable CAN-FD operation. CANsub will always enable CAN-FD on the PHY, but can filter out CAN-FD frames in the data stream.";
-                }
-                QCanBusDevice::setConfigurationParameter(key, value);
-            }
-            else
-            {
-                QString const errorMsg = QString("Invalid value for key CanFd with type %1 and value %2").
-                                         arg(value.typeName()).arg(value.toString());
-                qCritical() << errorMsg;
-                setError(errorMsg, ConfigurationError);
-            }
-            break;
-        }
-        case QCanBusDevice::ConfigurationKey::ReceiveOwnKey:
-        case CANsubConfigurationKeyListenOnly:
-        case CANsubConfigurationKeyAutoReset:
-        case CANsubConfigurationKeyErrorFramesEnabled:
-        {
-            if (!configurationHelperForwardIfValid<bool>(key, value))
-            {
-                QString const errorMsg = QString("Invalid value for key %1 with type %2").arg(key).arg(
-                    GET_VARIANT_TYPE(value));
-                setError(errorMsg, ConfigurationError);
-            }
-            break;
-        }
-        case CANsubConfigurationKeyDisableCertificateValidation:
-        {
-            qWarning() << "The DisableCertificateValidation configuration key has been deprecated and no longer has any effect";
-            break;
-        }
-        case CANsubConfigurationKeySamplePoint:
-        {
-            if ((value.isValid() && value.canConvert<uint>() && (value.value<uint>() <= 9999)) || !value.isValid())
-            {
-                /* Forward to the base class */
-                QCanBusDevice::setConfigurationParameter(key, value);
-            }
-            else
-            {
-                QString const errorMsg = QString("Invalid value for key SamplePoint with type %1").arg(
-                    GET_VARIANT_TYPE(value));
-                qCritical() << errorMsg;
-                setError(errorMsg, ConfigurationError);
-            }
-            break;
-        }
-        case CANsubConfigurationKeyExpectedHostname:
-        {
-            if (!configurationHelperForwardIfValid<QString>(key, value))
-            {
-                QString const errorMsg = QString("Invalid value for key ExpectedHostname with type %1").arg(GET_VARIANT_TYPE(value));
-                qCritical() << errorMsg;
-                setError(errorMsg, ConfigurationError);
-            }
-            break;
-        }
-        case CANsubConfigurationKeyBitTiming:
-        case CANsubConfigurationKeyBitTimingData:
-        {
-            if (!configurationHelperForwardIfValid<CANsubBitTiming>(key, value))
-            {
-                QString const keyName = (key == CANsubConfigurationKeyBitTiming) ? "BitTiming" : "BitTimingData";
-                QString const errorMsg = QString("Invalid value for key %1 with type %2").arg(keyName).arg(
-                    GET_VARIANT_TYPE(value));
-                qCritical() << errorMsg;
-                setError(errorMsg, ConfigurationError);
-            }
-            break;
-        }
-        default:
-        {
-            /* Forward all other requests to the base class */
-            QCanBusDevice::setConfigurationParameter(key, value);
-            break;
-        }
-    }
-}
-
-bool CANsub::writeFrame(const QCanBusFrame& frame)
-{
-    /* Gate on the device state rather than the websocket: the websocket is already valid during the settle window
-     * (ConnectingState), before the remote has associated it with the hardware CAN bus. */
-    if (state() != QCanBusDevice::ConnectedState)
-    {
-        setError("Attempting to write a frame to a CANsub device that is not connected", QCanBusDevice::WriteError);
+        setError(tr("Cannot write a frame to %1: The device is not connected.").arg(target.interfaceName), WriteError);
         return false;
     }
-    if (!frame.isValid())
+    Q_ASSERT(connection != nullptr);
+
+    if (frame.hasFlexibleDataRateFormat() && !session.canFd)
     {
-        setError("Attempting to write an invalid frame", QCanBusDevice::WriteError);
-        return false;
-    }
-    if (frame.hasFlexibleDataRateFormat() && !forwardFd)
-    {
-        setError("Attempting to write an FD frame to a non-FD bus", QCanBusDevice::WriteError);
-        return false;
-    }
-    if (frame.frameType() == QCanBusFrame::ErrorFrame)
-    {
-        setError("Attempting to write an error frame", QCanBusDevice::WriteError);
+        setError(tr("Cannot write the frame: CAN FD frames are disabled with the CanFdKey."), WriteError);
         return false;
     }
 
-    if (webSocket->bytesToWrite() > outstandingBytesLimit)
+    QString reason;
+    std::optional<cansub_frame> const out = toCansubFrame(frame, reason);
+    if (!out)
     {
-        /* Try a flush now */
-        webSocket->flush();
-        if (webSocket->bytesToWrite() > outstandingBytesLimit)
+        setError(tr("Cannot write the frame: %1").arg(reason), WriteError);
+        return false;
+    }
+
+    cansub_result result = connection->sendFrame(*out);
+
+    /* A write from a slot run by the nested event loop does not block again: It would invert the transmit order and
+     * nest the waits without bound. */
+    if ((result == CANSUB_RESULT_AGAIN) && session.blockingWrite && !inBlockingWrite)
+    {
+        /* WARNING: Runs a nested event loop, which may dispatch any event, including the deletion of this device */
+        QPointer<CANsub> alive(this);
+        Connection *const current = connection;
+
+        QEventLoop loop;
+        QTimer deadline;
+        deadline.setSingleShot(true);
+        connect(current, &Connection::readyToSend, &loop, &QEventLoop::quit);
+        connect(current, &Connection::closed, &loop, &QEventLoop::quit);
+        connect(this, &QCanBusDevice::stateChanged, &loop, &QEventLoop::quit);
+        connect(&deadline, &QTimer::timeout, &loop, &QEventLoop::quit);
+        deadline.start(blockingWriteTimeoutMs);
+
+        inBlockingWrite = true;
+        while ((result == CANSUB_RESULT_AGAIN) && deadline.isActive())
         {
-            /* Re-entrant blocking writes (a framesReceived emission dispatched from the nested loop below can lead a
-             * client slot back into writeFrame) fall through to the non-blocking drop: Nesting another wait would
-             * invert transmit order, consume the outer call's deadline and allow unbounded recursion. */
-            if (blockingWrites && !inBlockingWrite)
+            loop.exec();
+
+            if (alive.isNull())
             {
-                /* Block until the write can happen, up to a timeout of 1 s. A bytesWritten emission may reflect only
-                 * a partial flush of the backlog, so keep waiting until the backlog drops below the limit or the
-                 * deadline expires, instead of giving up on the first emission.
-                 * WARNING: This can potentially block the event loop */
-                QPointer<CANsub> alive(this);
-                QEventLoop loop;
-                QTimer timeoutTimer;
-                bool timedOut = false;
-                timeoutTimer.setSingleShot(true);
-                timeoutTimer.setInterval(1000);
-                connect(webSocket, &WebSocket::bytesWritten, &loop, &QEventLoop::quit);
-                connect(&timeoutTimer, &QTimer::timeout, &loop, [&loop, &timedOut]
-                {
-                    timedOut = true;
-                    loop.quit();
-                });
-                timeoutTimer.start();
-
-                inBlockingWrite = true;
-                while (!timedOut)
-                {
-                    loop.exec();
-
-                    /* The nested event loop dispatches arbitrary events. A connection loss handled inside it may have
-                     * led a client slot to delete this device. Touch no member in that case. (Deleting the device also
-                     * kills the bytesWritten connection, so the loop then exits via the stack-owned timeout timer.) */
-                    if (alive.isNull())
-                    {
-                        return false;
-                    }
-
-                    if (webSocket->bytesToWrite() <= outstandingBytesLimit)
-                    {
-                        break;
-                    }
-                }
-                inBlockingWrite = false;
-
-                /* The nested loop may have dispatched a connection loss. An aborted socket reports an empty backlog,
-                 * so the backlog re-check below would pass. Verify the device is still connected before
-                 * transmitting. */
-                if (state() != QCanBusDevice::ConnectedState)
-                {
-                    setError("Connection lost while waiting to transmit frame to remote CANsub device",
-                             QCanBusDevice::WriteError);
-                    return false;
-                }
-
-                /* Re-check condition. Do not block permanently, just drop this frame here. */
-                if (webSocket->bytesToWrite() > outstandingBytesLimit)
-                {
-                    setError("Unable to transmit frame to remote CANsub device", QCanBusDevice::WriteError);
-                    return false;
-                }
-            }
-            else
-            {
-                setError("Unable to transmit frame to remote CANsub device", QCanBusDevice::WriteError);
                 return false;
             }
+            if ((current != connection) || (state() != ConnectedState))
+            {
+                inBlockingWrite = false;
+                setError(tr("Cannot write the frame: The connection closed while waiting for space in the transmit "
+                            "buffer."), WriteError);
+                return false;
+            }
+
+            result = connection->sendFrame(*out);
         }
+        inBlockingWrite = false;
     }
 
-    QByteArray data;
-    CANsubProtocolEncode(data, frame);
-    qint64 const bytesSent = webSocket->sendBinaryMessage(data);
-    if (bytesSent == data.size())
+    switch (result)
     {
-        /* Ensure no previous write error has survived to here */
-        if (error() == QCanBusDevice::WriteError)
+    case CANSUB_RESULT_OK:
+    {
+        /* Do not leave an earlier write error behind */
+        if (error() == WriteError)
         {
             clearError();
         }
 
-        framesWritten(1);
+        emit framesWritten(1);
         return true;
     }
-
-    setError("Unable to transmit the whole frame to remote CANsub device", QCanBusDevice::WriteError);
-    return false;
-}
-
-static std::optional<CombinedBitTiming> getBitTiming(uint bitrate, uint bitrateData, uint samplePoint)
-{
-    std::optional<CombinedBitTiming> result;
-
-    /* Map of default bit-timings. Currently only populated for a sample point of 80 %. */
-    static QMap<CombinedBitTimingKey, CombinedBitTiming> bitrates(
+    case CANSUB_RESULT_AGAIN:
     {
-        {{8000, 50000, 1000000}, {8, 159, 40, 4, 7, 2, 2}},
-        {{8000, 100000, 1000000}, {4, 159, 40, 4, 15, 4, 4}},
-        {{8000, 100000, 2000000}, {4, 159, 40, 4, 7, 2, 2}},
-        {{8000, 125000, 1000000}, {4, 127, 32, 4, 15, 4, 4}},
-        {{8000, 125000, 2000000}, {2, 255, 64, 4, 15, 4, 4}},
-        {{8000, 125000, 4000000}, {2, 255, 64, 4, 7, 2, 2}},
-        {{8000, 200000, 1000000}, {4, 79, 20, 4, 15, 4, 4}},
-        {{8000, 200000, 2000000}, {2, 159, 40, 4, 15, 4, 4}},
-        {{8000, 200000, 4000000}, {2, 159, 40, 4, 7, 2, 2}},
-        {{8000, 250000, 1000000}, {4, 63, 16, 4, 15, 4, 4}},
-        {{8000, 250000, 2000000}, {2, 127, 32, 4, 15, 4, 4}},
-        {{8000, 250000, 4000000}, {1, 255, 64, 4, 15, 4, 4}},
-        {{8000, 500000, 1000000}, {4, 31, 8, 4, 15, 4, 4}},
-        {{8000, 500000, 2000000}, {2, 63, 16, 4, 15, 4, 4}},
-        {{8000, 500000, 4000000}, {1, 127, 32, 4, 15, 4, 4}},
-        {{8000, 800000, 1000000}, {4, 19, 5, 4, 15, 4, 4}},
-        {{8000, 800000, 2000000}, {2, 39, 10, 4, 15, 4, 4}},
-        {{8000, 800000, 4000000}, {1, 79, 20, 4, 15, 4, 4}},
-        {{8000, 1000000, 1000000}, {4, 15, 4, 4, 15, 4, 4}},
-        {{8000, 1000000, 2000000}, {2, 31, 8, 4, 15, 4, 4}},
-        {{8000, 1000000, 4000000}, {1, 63, 16, 4, 15, 4, 4}},
-    });
-
-    CombinedBitTimingKey const key = {samplePoint, bitrate, bitrateData};
-
-    if (bitrates.contains(key))
-    {
-        result.emplace(bitrates[key]);
-    }
-
-    return result;
-}
-
-void CANsub::wsDataReceived(QByteArray const& data)
-{
-    if (!bufferRx.append(reinterpret_cast<std::byte const*>(data.constData()), static_cast<std::size_t>(data.size())))
-    {
-        /* The receive buffer is full and could not be reclaimed: Drop the current buffer and attempt again. */
-        qWarning() << "Receive buffer overflow, dropping the current buffer";
-        bufferRx.clear();
-
-        if (!bufferRx.append(reinterpret_cast<std::byte const*>(data.constData()), static_cast<std::size_t>(data.size())))
-        {
-            /* The receive buffer is not large enough to handle this payload at all, drop it all. */
-            qWarning() << "Receive buffer not large enough to handle received payload";
-            return;
-        }
-    }
-
-    /* Clear local storage and attempt to decode as many frames as possible from the rx buffer into the frame buffer */
-    receivedFrames.clear();
-    CANsubProtocolDecode(bufferRx, receivedFrames);
-
-    /* Filter out all the frames we do not want to see */
-    receivedFrames.erase(
-        std::remove_if(
-            receivedFrames.begin(),
-            receivedFrames.end(),
-            [forwardFd = forwardFd](QCanBusFrame const& v)
-            {
-                if (!forwardFd && (v.frameType() == QCanBusFrame::FrameType::DataFrame) && (v.
-                    hasFlexibleDataRateFormat()))
-                {
-                    return true;
-                }
-                return false;
-            }
-            ), receivedFrames.end());
-    if (!receivedFrames.empty())
-    {
-        enqueueReceivedFrames(receivedFrames);
-    }
-}
-
-bool CANsub::acceptSslErrors(QList<QSslError> const& errors) const
-{
-    bool validCertificateChain = false;
-
-    /* We always connect to the resolved IP, so a HostNameMismatch is expected. Verify the certificate's identity
-     * against the verification hostname (the mDNS hostname, or the user-supplied expected hostname when connecting by
-     * IP) instead. If no hostname is supplied, accept a hostname mismatch, but ensure that the certificate *is* the
-     * correct root certificate. */
-    if ((errors.size() == 1) && (errors.first().error() == QSslError::HostNameMismatch))
-    {
-        /* If no hostname is set, we are connecting by IP and only require the root certificate to be valid. */
-        if (tlsPolicy.verificationHostname.isEmpty())
-        {
-            qWarning() << "Hostname validation is disabled, but correct root found";
-            return true;
-        }
-
-        /* The hostname must either be part of the common name or one of the SANs */
-        auto const& certificate = errors.first().certificate();
-        QStringList commonNames = certificate.subjectInfo(QSslCertificate::SubjectInfo::CommonName);
-        if (commonNames.length() != 1)
-        {
-            /* There should never be more than one common name in the subject field */
-            qWarning() << "Invalid device certificate";
-            return false;
-        }
-        if (commonNames.first().compare("CANsub " + tlsPolicy.verificationHostname, Qt::CaseInsensitive) == 0)
-        {
-            /* Full match */
-            return true;
-        }
-
-        /* Check if any of the Subject Alternative Names matches */
-        for (auto const& san : certificate.subjectAlternativeNames().values(QSsl::DnsEntry))
-        {
-            if (san.compare(tlsPolicy.verificationHostname, Qt::CaseInsensitive) == 0)
-            {
-                return true;
-            }
-        }
-    }
-
-    qCritical() << "SSL connection failed with non-recoverable errors:" << errors;
-    return false;
-}
-
-void CANsub::versionCheckSlot(QString const& value)
-{
-    /* Cache the version value. It cannot change while the bus is open. */
-    version = value;
-
-    if (version.value<QString>() == CANSUB_EXPECTED_VERSION_JSON)
-    {
-        emit versionCheckComplete(QPrivateSignal());
-    }
-    else
-    {
-        recordPendingError(
-            QStringLiteral("Unsupported remote firmware version %1 (expected %2)").arg(
-                QString(version.toString()).remove('"') , CANSUB_EXPECTED_VERSION),
-            QString(), ConnectionError);
-
-        emit versionCheckError(QPrivateSignal());
-    }
-}
-
-void CANsub::versionCheckErrorSlot(QString const& summary, QNetworkReply::NetworkError error, const QString& errorStr)
-{
-    Q_UNUSED(summary);
-    Q_UNUSED(error);
-
-    recordPendingError(QStringLiteral("Version query failed"), errorStr, ConnectionError);
-
-    emit versionCheckError(QPrivateSignal());
-}
-
-void CANsub::stateMachineDestroy()
-{
-    if (!connectionStateMachine)
-    {
-        return;
-    }
-
-    /* Disconnect the API from the state machine (so they don't use the soon-to-be nullptr) */
-    disconnect(&api, nullptr, connectionStateMachine, nullptr);
-
-    connectionStateMachine->deleteLater();
-    connectionStateMachine = nullptr;
-}
-
-template <typename OkSignal, typename ErrSignal>
-void CANsub::wireRequestState(QState* state, std::function<void()> onEntered,
-                              OkSignal ok, QAbstractState* onOk,
-                              ErrSignal err, QAbstractState* onError)
-{
-    wireGenericState(state, onEntered, &api, ok, onOk, &api, err, onError);
-}
-
-template <typename OkSignal, typename ErrSignal>
-void CANsub::wireRequestState(QState* state, std::function<void()> onEntered,
-                              OkSignal ok, QAbstractState* onOk,
-                              ErrSignal err, QAbstractState* onError,
-                              QString errorContext, CanBusError errorCode)
-{
-    wireRequestState(state, std::move(onEntered), ok, onOk, err, onError);
-    wireErrorCapture(err, std::move(errorContext), errorCode);
-}
-
-void CANsub::recordPendingError(QString const& context, QString const& detail, CanBusError code)
-{
-    if (!pendingErrorString.isEmpty())
-    {
-        /* Only keep track of the first error, such that later failures does not hide the root cause. */
-        return;
-    }
-
-    pendingErrorString = detail.isEmpty() ? context : QStringLiteral("%1: %2").arg(context, detail);
-    pendingErrorCode = code;
-}
-
-void CANsub::reportPendingError()
-{
-    if (pendingErrorCode == NoError)
-    {
-        pendingErrorCode = ConnectionError;
-    }
-    if (pendingErrorString.isEmpty())
-    {
-        pendingErrorString = QStringLiteral("Error during connection attempt");
-    }
-
-    setError(pendingErrorString, pendingErrorCode);
-}
-
-void CANsub::abortOpen()
-{
-    /* A synchronous failure may happen before or after the state machine has been allocated */
-    if (connectionStateMachine)
-    {
-        stateMachineDestroy();
-    }
-
-    /* Report synchronously so error()/errorString() are populated once connectDevice() returns, matching the
-     * plugins shipped with Qt (they call setError() directly in their open() paths). The emission runs while
-     * QCanBusDevice::connectDevice() is still on the stack, so a client slot deleting this device directly,
-     * instead of via deleteLater() as Qt requires when deleting a signal's sender, leaves connectDevice() on a
-     * dangling this. Consequently nothing may touch this object after the report, and callers must return
-     * immediately. */
-    reportPendingError();
-}
-
-void CANsub::wireErrorCapture(void (OpenAPI::OAIDefaultApi::*err)(QNetworkReply::NetworkError, QString const&),
-                              QString errorContext, CanBusError errorCode)
-{
-    connect(&api, err, connectionStateMachine,
-            [this, errorContext = std::move(errorContext), errorCode](QNetworkReply::NetworkError, QString const& detail)
-            {
-                recordPendingError(errorContext, detail, errorCode);
-            });
-}
-
-template <typename Summary>
-void CANsub::wireErrorCapture(void (OpenAPI::OAIDefaultApi::*err)(Summary, QNetworkReply::NetworkError, QString const&),
-                              QString errorContext, CanBusError errorCode)
-{
-    connect(&api, err, connectionStateMachine,
-            [this, errorContext = std::move(errorContext), errorCode](Summary const&, QNetworkReply::NetworkError,
-                                                                      QString const& detail)
-            {
-                recordPendingError(errorContext, detail, errorCode);
-            });
-}
-
-template <typename OkSender, typename OkSignal, typename ErrSender, typename ErrSignal>
-void CANsub::wireGenericState(
-    QState* state,
-    std::function<void()> onEntered,
-    OkSender okSender, OkSignal ok, QAbstractState* onOk,
-    ErrSender errSender, ErrSignal err, QAbstractState* onError)
-{
-    connect(state, &QState::entered, this, std::move(onEntered));
-    state->addTransition(okSender, ok, onOk);
-    state->addTransition(errSender, err, onError);
-}
-
-bool CANsub::addressIsIp() const
-{
-    return !QHostAddress(deviceAddress).isNull();
-}
-
-bool CANsub::resolveTlsPolicy()
-{
-    auto* const nam = dynamic_cast<NetworkManagerWithPeerInfo*>(networkAccessManager);
-    if (!nam)
-    {
-        recordPendingError(QStringLiteral("Internal error: unexpected network access manager type"), QString(),
-                           ConnectionError);
+        setError(tr("Cannot write the frame: The transmit buffer is full."), WriteError);
         return false;
     }
-
-    if (!addressIsIp())
+    case CANSUB_RESULT_CLOSED:
     {
-        /* Hostname connection. Verify the certificate against the hostname. */
-        tlsPolicy.verificationHostname = deviceAddress;
-        nam->setTlsPolicy(tlsPolicy);
-        return true;
+        setError(tr("Cannot write the frame: The connection is closing."), WriteError);
+        return false;
     }
-
-    /* IP connection. The certificate is issued for the mDNS hostname and cannot match the IP, so the user ought to
-     * tell us how to handle verification via the expected hostname. */
-    QVariant const expectedHostNameRaw = configurationParameter(CANsubConfigurationKeyExpectedHostname);
-    QString const expectedHostname = (expectedHostNameRaw.isValid() && expectedHostNameRaw.canConvert<QString>()) ? expectedHostNameRaw.toString() : QString();
-
-    if (!expectedHostname.isEmpty())
+    default:
     {
-        /* Verify the certificate against the user-supplied hostname instead of the IP. */
-        tlsPolicy.verificationHostname = expectedHostname;
-        nam->setTlsPolicy(tlsPolicy);
-        return true;
+        setError(tr("Cannot write the frame: %1").arg(resultDescription(result)), WriteError);
+        return false;
     }
-
-    /* Fallback. No hostname supplied but we still verify the certificate chain. */
-    tlsPolicy.verificationHostname.clear();
-    nam->setTlsPolicy(tlsPolicy);
-    return true;
-}
-
-void CANsub::configureLookupState(CANsubConnectionStates const& connectionStates)
-{
-    /* The lookup state's success/error are CANsub signals emitted from this object, not from the api */
-    wireGenericState(
-        connectionStates.lookupHost,
-        [this]()
-        {
-            qDebug() << "Entering lookupHostState";
-
-            /* If the user supplied a raw IP there is nothing to resolve, use it directly and continue */
-            if (addressIsIp())
-            {
-                resolvedHost.setValue(deviceAddress);
-                emit dnsLookupComplete(QPrivateSignal());
-                return;
-            }
-
-            /* We want to perform an mDNS lookup. As such, it is important that the hostname we look up ends
-             * with a "." */
-            QString const lookupName = deviceAddress + ".";
-
-            auto resolver = resolverFactory->createResolver(lookupName.toUtf8(), connectionStateMachine);
-            if (!resolver)
-            {
-                emit dnsLookupError(QPrivateSignal());
-                return;
-            }
-            auto* const resolverTimer = new QTimer(connectionStateMachine);
-
-            resolverTimer->setInterval(CANSUB_MDNS_TIMEOUT_MS);
-            resolverTimer->setSingleShot(true);
-
-            connect(resolverTimer, &QTimer::timeout, resolver, &QObject::deleteLater);
-            connect(resolverTimer, &QTimer::timeout, resolverTimer, &QTimer::deleteLater);
-            connect(resolverTimer, &QTimer::timeout, this, [this, resolver]
-            {
-                /* Both deleteLater() calls above are deferred, so the resolver can still emit resolved() until its
-                 * deletion is processed, and the resolved handler dereferences the (equally deferred-deleted) timer.
-                 * Cut the connection so a late result cannot reach it. */
-                disconnect(resolver, nullptr, this, nullptr);
-                emit dnsLookupError(QPrivateSignal());
-            });
-
-            std::shared_ptr<bool> resolved = std::make_shared<bool>(false);
-            connect(resolver, &HostResolver::resolved, this,
-                    [this, resolved, resolver, resolverTimer](QHostAddress const& address)
-                    {
-                        /* CANsub only supports IPv4 */
-                        if ((*resolved == false) && (address.protocol() == QAbstractSocket::IPv4Protocol))
-                        {
-                            *resolved = true;
-                            resolverTimer->stop();
-                            resolverTimer->deleteLater();
-                            resolver->deleteLater();
-                            resolvedHost.setValue(address.toString());
-                            emit dnsLookupComplete(QPrivateSignal());
-                        }
-                    });
-
-            resolverTimer->start();
-        },
-        this, &CANsub::dnsLookupComplete, connectionStates.getVersion,
-        this, &CANsub::dnsLookupError, connectionStates.error
-        );
-}
-
-void CANsub::configureGetVersionState(CANsubConnectionStates const& connectionStates)
-{
-    QVariant const updateTimeRaw = configurationParameter(CANsubConfigurationKeyUpdateTime);
-    bool updateTime = false;
-    if (updateTimeRaw.isValid() && updateTimeRaw.canConvert<bool>() && updateTimeRaw.value<bool>())
-    {
-        updateTime = true;
     }
-
-    /* The version state's success/error are CANsub signals emitted from this object (via versionCheckSlot), not
-     * directly from the api. */
-    wireGenericState(
-        connectionStates.getVersion,
-        [this]()
-        {
-            qDebug() << "Entering getVersionState";
-
-            if (!resolvedHost.isValid() || !resolvedHost.canConvert<QString>())
-            {
-                qCritical() << "Attempting to resolve invalid name";
-                emit versionCheckError(QPrivateSignal());
-                return;
-            }
-
-            QUrl serverUrl;
-            serverUrl.setScheme("https");
-            serverUrl.setHost(resolvedHost.toString());
-            serverUrl.setPort(443);
-
-            /* Store the default REST endpoint */
-            api.setNewServerForAllOperations(serverUrl);
-
-            /* Check if we previously resolved the version to a supported instance */
-            if (version.isValid() && version.canConvert<QString>() && version.value<QString>() ==
-                CANSUB_EXPECTED_VERSION_JSON)
-            {
-                qDebug() << "Version is already valid, skipping";
-                emit versionCheckComplete(QPrivateSignal());
-            }
-            else if (version.isValid())
-            {
-                qDebug() << "Version is already invalid, skipping" << version.toString();
-                recordPendingError(QStringLiteral("Unsupported remote firmware version %1 (expected %2)").arg(QString(version.toString()).remove('"') , CANSUB_EXPECTED_VERSION), QString(), ConnectionError);
-                emit versionCheckError(QPrivateSignal());
-            }
-            else
-            {
-                qDebug() << "Requesting version via API";
-                api.apiVersionGet();
-            }
-        },
-        this, &CANsub::versionCheckComplete, updateTime ? connectionStates.getTime : connectionStates.setBusPhy,
-        this, &CANsub::versionCheckError, connectionStates.error
-        );
 }
 
-/**
- * Compute the absolute difference (in ms) between the remote clock reported in a apiTimeGetSignal and the local
- * clock. Returns an empty optional if the signal arguments are malformed or the reported time is invalid, in which
- * case neither sync transition fires and the invalid-time guard routes the machine to the error state.
- */
-static std::optional<qint64> remoteClockDeltaMs(QList<QVariant> const& args)
+QString CANsub::interpretErrorFrame(QCanBusFrame const &errorFrame)
 {
-    if (args.size() != 1)
-    {
-        qWarning() << "Invalid number of arguments";
-        return std::nullopt;
-    }
-    if (GET_VARIANT_TYPE(args.at(0)) != qMetaTypeId<OpenAPI::OAITime>())
-    {
-        qWarning() << "Invalid type";
-        return std::nullopt;
-    }
-
-    const auto time = args.at(0).value<OpenAPI::OAITime>();
-    QDateTime value = time.getUtc();
-
-    /* The generated client emits the success signal with a default-constructed QDateTime when an HTTP 200 body
-     * fails to parse. toMSecsSinceEpoch() on it is undefined, so reject it here. */
-    if (!value.isValid())
-    {
-        qWarning() << "Invalid remote time";
-        return std::nullopt;
-    }
-
-    /* The device reports its time in UTC (RFC3339 'Z'). Re-label rather than convert, in case the generated
-     * deserializer dropped the timespec: The calendar digits are UTC digits either way, so this is a no-op on a
-     * correctly labelled value. */
-    CANSUB_SET_UTC(value);
-
-    return qAbs(value.toMSecsSinceEpoch() - QDateTime::currentMSecsSinceEpoch());
+    return describeErrorFrame(errorFrame);
 }
 
-void CANsub::configureGetTimeState(CANsubConnectionStates const& connectionStates)
-{
-    /* The getTime state needs custom handling: the same apiTimeGetSignal drives one of two transitions depending on
-     * how far the remote clock has drifted, so it cannot use the generic ok/error helper. */
-    connect(connectionStates.getTime, &QState::entered, this, [this]
-    {
-        qDebug() << "Entering getTimeState";
-        api.apiTimeGet();
-    });
-
-    auto const addTimeGuard = [this, &connectionStates](std::function<bool(qint64)> const& accept,
-                                                        QAbstractState* target)
-    {
-        auto* const transition = new GuardedTransition(connectionStates.getTime, [accept](QList<QVariant> const& args)
-        {
-            auto const delta = remoteClockDeltaMs(args);
-            return delta.has_value() && accept(delta.value());
-        });
-        transition->setSenderObject(&api);
-        transition->setSignal(
-            QMetaMethod::fromSignal(&OpenAPI::OAIDefaultApi::apiTimeGetSignal).methodSignature().constData());
-        transition->setTargetState(target);
-        connectionStates.getTime->addTransition(transition);
-    };
-
-    /* Out of sync (>= 1 s): push the current time before configuring the bus. */
-    addTimeGuard([](qint64 delta) { return delta >= 1000; }, connectionStates.setTime);
-
-    /* In sync (< 1 s): skip straight to the bus configuration. */
-    addTimeGuard([](qint64 delta) { return delta < 1000; }, connectionStates.setBusPhy);
-
-    /* Malformed or invalid time payload (e.g. an HTTP 200 whose body failed to parse): Fail the attempt instead of
-     * sitting in getTime with no pending request. Transitions are tested in the order they were added, so this
-     * guard only runs after both sync guards have rejected, and its recording side effect only fires when the
-     * transition is actually taken. */
-    auto* const invalidTimeTransition = new GuardedTransition(connectionStates.getTime,
-                                                              [this](QList<QVariant> const& args)
-    {
-        if (remoteClockDeltaMs(args).has_value())
-        {
-            return false;
-        }
-        recordPendingError(QStringLiteral("Remote returned an invalid time (channel %1)").arg(deviceChannel),
-                           QString(), ConfigurationError);
-        return true;
-    });
-    invalidTimeTransition->setSenderObject(&api);
-    invalidTimeTransition->setSignal(
-        QMetaMethod::fromSignal(&OpenAPI::OAIDefaultApi::apiTimeGetSignal).methodSignature().constData());
-    invalidTimeTransition->setTargetState(connectionStates.error);
-    connectionStates.getTime->addTransition(invalidTimeTransition);
-
-    connectionStates.getTime->addTransition(&api, &OpenAPI::OAIDefaultApi::apiTimeGetSignalError, connectionStates.error);
-    wireErrorCapture(&OpenAPI::OAIDefaultApi::apiTimeGetSignalError,
-                     QStringLiteral("Getting remote time failed (channel %1)").arg(deviceChannel), ConfigurationError);
-}
-
-void CANsub::configureSetTimeState(CANsubConnectionStates const& connectionStates)
-{
-    wireRequestState(
-        connectionStates.setTime,
-        [this]()
-        {
-            qDebug() << "Entering setTimeState";
-
-            OpenAPI::OAITime time;
-            time.setUtc(QDateTime::currentDateTimeUtc());
-            time.setRatePpb(0);
-            api.apiTimePut(time);
-        },
-        &OpenAPI::OAIDefaultApi::apiTimePutSignal, connectionStates.setBusPhy,
-        &OpenAPI::OAIDefaultApi::apiTimePutSignalError, connectionStates.error,
-        QStringLiteral("Setting remote time failed (channel %1)").arg(deviceChannel), ConfigurationError
-        );
-}
-
-bool CANsub::configureSetBusPhyState(CANsubConnectionStates const& connectionStates)
-{
-    /* Create command */
-    OpenAPI::OAIPhy command;
-    {
-        /* Check that we are either running with all parameters as bitrates or bit-timings */
-        QVariant const bitRate = configurationParameter(ConfigurationKey::BitRateKey);
-        QVariant const bitRateData = configurationParameter(ConfigurationKey::DataBitRateKey);
-        QVariant const samplePoint = configurationParameter(CANsubConfigurationKeySamplePoint);
-        QVariant const bitTiming = configurationParameter(CANsubConfigurationKeyBitTiming);
-        QVariant const bitTimingData = configurationParameter(CANsubConfigurationKeyBitTimingData);
-
-        if ((bitTiming.isValid() && bitTiming.canConvert<CANsubBitTiming>()) &&
-            (bitTimingData.isValid() && bitTimingData.canConvert<CANsubBitTiming>()))
-        {
-            /* When using bit-timing, both regular and data timings must be present */
-            {
-                auto const bitTimingValue = bitTiming.value<CANsubBitTiming>();
-                OpenAPI::OAIBittiming bt;
-                bt.setBrp(bitTimingValue.brp);
-                bt.setSeg1(bitTimingValue.tseg1);
-                bt.setSeg2(bitTimingValue.tseg2);
-                bt.setSjw(bitTimingValue.sjw);
-                command.setTiming(bt);
-            }
-
-            {
-                auto const bitTimingDataValue = bitTimingData.value<CANsubBitTiming>();
-                OpenAPI::OAIBittiming bt;
-                bt.setBrp(bitTimingDataValue.brp);
-                bt.setSeg1(bitTimingDataValue.tseg1);
-                bt.setSeg2(bitTimingDataValue.tseg2);
-                bt.setSjw(bitTimingDataValue.sjw);
-                command.setTimingData(bt);
-            }
-        }
-        else if ((bitRate.isValid() && bitRate.canConvert<uint>()) &&
-            (samplePoint.isValid() && samplePoint.canConvert<uint>()))
-        {
-            std::optional<CombinedBitTiming> timingParameters;
-
-            if ((bitRateData.isValid() && bitRateData.canConvert<uint>()))
-            {
-                timingParameters = getBitTiming(bitRate.toUInt(), bitRateData.toUInt(), samplePoint.toUInt());
-            }
-            else
-            {
-                qWarning() <<
-                    "Data bitrate not set, but CANsub will always run with FD enabled. Using default data rate of 1000000";
-                timingParameters = getBitTiming(bitRate.toUInt(), 1000000, samplePoint.toUInt());
-                if (!timingParameters.has_value())
-                {
-                    QString const errorMsg = QString("Can't get bitrate parameters for %1 - 1000000 at a sample point of %2").
-                                         arg(bitRate.toUInt()).arg(samplePoint.toUInt());
-                    qCritical() << errorMsg;
-                    recordPendingError(errorMsg, QString(), ConfigurationError);
-                    return false;
-                }
-            }
-
-            if (!timingParameters.has_value())
-            {
-                QString const errorMsg = QString("Can't get bitrate parameters for %1 - %2 at a sample point of %3").
-                                         arg(bitRate.toUInt()).arg(bitRateData.toUInt()).arg(samplePoint.toUInt());
-                qCritical() << errorMsg;
-                recordPendingError(errorMsg, QString(), ConfigurationError);
-                return false;
-            }
-
-            {
-                OpenAPI::OAIBittiming bt;
-                bt.setBrp(static_cast<qint32>(timingParameters.value().brp));
-                bt.setSeg1(static_cast<qint32>(timingParameters.value().tseg1));
-                bt.setSeg2(static_cast<qint32>(timingParameters.value().tseg2));
-                bt.setSjw(static_cast<qint32>(timingParameters.value().sjw));
-                command.setTiming(bt);
-            }
-
-            {
-                OpenAPI::OAIBittiming bt;
-                bt.setBrp(static_cast<qint32>(timingParameters.value().brp));
-                bt.setSeg1(static_cast<qint32>(timingParameters.value().tseg1_data));
-                bt.setSeg2(static_cast<qint32>(timingParameters.value().tseg2_data));
-                bt.setSjw(static_cast<qint32>(timingParameters.value().sjw_data));
-                command.setTimingData(bt);
-            }
-        }
-        else
-        {
-            QString const errorMsg = "Either bit-timings or bitrates and sample point must be configured";
-            qCritical() << errorMsg;
-            recordPendingError(errorMsg, QString(), ConfigurationError);
-            return false;
-        }
-
-        QVariant const listenOnly = configurationParameter(CANsubConfigurationKeyListenOnly);
-        if (!listenOnly.isValid())
-        {
-            command.setListenOnly(CANsubConfigurationKeyListenOnly_default);
-        }
-        else
-        {
-            command.setListenOnly(listenOnly.toBool());
-        }
-
-        QVariant const autoReset = configurationParameter(CANsubConfigurationKeyAutoReset);
-        if (!autoReset.isValid())
-        {
-            command.setAutoReset(CANsubConfigurationKeyAutoReset_default);
-        }
-        else
-        {
-            command.setAutoReset(autoReset.toBool());
-        }
-
-        QVariant const errorFramesEnabled = configurationParameter(CANsubConfigurationKeyErrorFramesEnabled);
-        if (!errorFramesEnabled.isValid())
-        {
-            command.setErrorFrames(CANsubConfigurationKeyErrorFramesEnabled_default);
-        }
-        else
-        {
-            command.setErrorFrames(errorFramesEnabled.toBool());
-        }
-
-        QVariant const receiveOwn = configurationParameter(QCanBusDevice::ConfigurationKey::ReceiveOwnKey);
-        if (!receiveOwn.isValid())
-        {
-            command.setTxAckFrames(CANsubConfigurationKeyReceiveOwn_default);
-        }
-        else
-        {
-            command.setTxAckFrames(receiveOwn.toBool());
-        }
-    }
-
-    wireRequestState(
-        connectionStates.setBusPhy,
-        [this, command]()
-        {
-            qDebug() << "Entering setBusPhyState";
-
-            api.apiCanChannelPhyPut(deviceChannel, command);
-        },
-        &OpenAPI::OAIDefaultApi::apiCanChannelPhyPutSignal, connectionStates.getBusFilters,
-        &OpenAPI::OAIDefaultApi::apiCanChannelPhyPutSignalError, connectionStates.error,
-        QStringLiteral("Configuring CAN PHY failed (channel %1)").arg(deviceChannel), ConfigurationError
-        );
-
-    return true;
-}
-
-void CANsub::configureGetBusFiltersState(CANsubConnectionStates const& connectionStates)
-{
-    /* We need some custom logic to handle the filters. If there are any filters installed, we need to clear them.
-     * If the list is already cleared, we can continue. */
-    auto* const filtersEmptyTransition = new LogicTransition(connectionStates.setBusFilters);
-    connectionStates.getBusFilters->addTransition(filtersEmptyTransition);
-
-    connect(&api, &OpenAPI::OAIDefaultApi::apiCanChannelFilterGetSignal, connectionStateMachine,
-            [this, connectionStates, filtersEmptyTransition](QList<qint32> summary)
-            {
-                if (summary.isEmpty())
-                {
-                    filtersEmptyTransition->trigger();
-                }
-                else
-                {
-                    /* Clear all remote filters */
-                    auto* const tracker = new BatchTracker(summary.length(), connectionStateMachine);
-                    connect(&api, &OpenAPI::OAIDefaultApi::apiCanChannelFilterFilterIdDeleteSignal, tracker,
-                            &BatchTracker::requestFinishedOk);
-                    connect(&api, &OpenAPI::OAIDefaultApi::apiCanChannelFilterFilterIdDeleteSignalError, tracker,
-                            &BatchTracker::requestFinishedError);
-
-                    wireErrorCapture(&OpenAPI::OAIDefaultApi::apiCanChannelFilterFilterIdDeleteSignalError,
-                                     QStringLiteral("Clearing remote filters failed (channel %1)").arg(deviceChannel),
-                                     ConfigurationError);
-
-                    connectionStates.getBusFilters->addTransition(tracker, &BatchTracker::finishedOk,
-                                                                  connectionStates.setBusFilters);
-                    connectionStates.getBusFilters->addTransition(tracker, &BatchTracker::finishedWithErrors,
-                                                                  connectionStates.error);
-
-                    for (auto const& filterId : summary)
-                    {
-                        api.apiCanChannelFilterFilterIdDelete(deviceChannel, filterId);
-                    }
-                }
-            });
-
-    connect(connectionStates.getBusFilters, &QState::entered, this, [this]
-    {
-        qDebug() << "Entering getBusFilters";
-
-        /* Request all installed filters */
-        api.apiCanChannelFilterGet(deviceChannel);
-    });
-
-    connectionStates.getBusFilters->addTransition(&api, &OpenAPI::OAIDefaultApi::apiCanChannelFilterGetSignalError,
-                                                  connectionStates.error);
-
-    wireErrorCapture(&OpenAPI::OAIDefaultApi::apiCanChannelFilterGetSignalError,
-                     QStringLiteral("Getting remote filters failed (channel %1)").arg(deviceChannel), ConfigurationError);
-}
-
-void CANsub::configureSetBusFiltersState(CANsubConnectionStates const& connectionStates)
-{
-    auto* const tracker = new BatchTracker(2, connectionStateMachine);
-
-    /* The completion signals here originate from the BatchTracker, not the api, so use the generic helper. */
-    wireGenericState(
-        connectionStates.setBusFilters,
-        [this, tracker]()
-        {
-            qDebug() << "Entering setBusFilters";
-
-            connect(&api, &OpenAPI::OAIDefaultApi::apiCanChannelFilterPostSignal, tracker,
-                    &BatchTracker::requestFinishedOk);
-            connect(&api, &OpenAPI::OAIDefaultApi::apiCanChannelFilterPostSignalError, tracker,
-                    &BatchTracker::requestFinishedError);
-
-            wireErrorCapture(&OpenAPI::OAIDefaultApi::apiCanChannelFilterPostSignalError,
-                             QStringLiteral("Setting remote filters failed (channel %1)").arg(deviceChannel),
-                             ConfigurationError);
-
-            /* Insert default filters */
-            {
-                OpenAPI::OAIFilter filter;
-                filter.setF1(0x000);
-                filter.setF2(0x000);
-                filter.setIsExtended(false);
-                filter.setIsRange(false);
-                api.apiCanChannelFilterPost(deviceChannel, filter);
-            }
-            {
-                OpenAPI::OAIFilter filter;
-                filter.setF1(0x00000000);
-                filter.setF2(0x00000000);
-                filter.setIsExtended(true);
-                filter.setIsRange(false);
-                api.apiCanChannelFilterPost(deviceChannel, filter);
-            }
-        },
-        tracker, &BatchTracker::finishedOk, connectionStates.openWebSocket,
-        tracker, &BatchTracker::finishedWithErrors, connectionStates.error
-        );
-}
-
-void CANsub::configureOpenWebsocketState(CANsubConnectionStates const& connectionStates)
-{
-    /* Resolve the per-connection forwarding policy. These feed the binaryMessageReceived handler that is wired once
-     * in the constructor, so they must be set before the websocket opens. */
-    QVariant const forwardFdRaw = configurationParameter(QCanBusDevice::ConfigurationKey::CanFdKey);
-    QVariant const blockRaw = configurationParameter(CANsubConfigurationKeyBlockingWrite);
-    blockingWrites = (blockRaw.isValid() && blockRaw.canConvert<bool>()) ? blockRaw.value<bool>() : false;
-
-    forwardFd = (forwardFdRaw.isValid()) ? forwardFdRaw.value<bool>() : false;
-
-    connect(connectionStates.openWebSocket, &QState::entered, this, [this]
-    {
-        qDebug() << "Entering openWebSocketState";
-
-        QUrl remote;
-        remote.setScheme("wss");
-        remote.setHost(resolvedHost.toString());
-        remote.setPort(443);
-        remote.setPath(QString("/api/can/%1/ws").arg(deviceChannel));
-
-        /* Start from the shared configuration that trusts only the embedded CANsub root certificate. The hostname
-         * is verified against tlsPolicy.verificationHostname if set (a HostNameMismatch is expected, as we connect
-         * by IP). */
-        QSslConfiguration sslConfiguration = coreSslConfiguration();
-        webSocket->setSslConfiguration(sslConfiguration);
-        webSocket->setPeerVerifyName(tlsPolicy.verificationHostname);
-        webSocket->open(remote);
-    });
-
-    /* There is a slight delay between the opening of the websocket and the actual hardware being ready. Introduce a
-     * slight delay here to allow for state settling. */
-    auto* const settleState = new QState(connectionStateMachine);
-    auto* const settleTimer = new QTimer(connectionStateMachine);
-    settleTimer->setSingleShot(true);
-    settleTimer->setInterval(CANSUB_WS_SETTLE_MS);
-
-    connect(settleState, &QState::entered, this, [settleTimer]
-    {
-        qDebug() << "Entering settleState";
-        settleTimer->start();
-    });
-
-    /* Set a timeout on the websocket */
-    auto* const connectTimeoutTimer = new QTimer(connectionStateMachine);
-    connectTimeoutTimer->setSingleShot(true);
-    connectTimeoutTimer->setInterval(CANSUB_WEBSOCKET_TIMEOUT_MS);
-
-    connect(connectionStates.openWebSocket, &QState::entered, this, [connectTimeoutTimer]
-    {
-        connectTimeoutTimer->start();
-    });
-    connect(connectionStates.openWebSocket, &QState::exited, connectTimeoutTimer, &QTimer::stop);
-
-    connect(connectTimeoutTimer, &QTimer::timeout, this, [this]
-    {
-        recordPendingError(QStringLiteral("Timed out opening websocket (channel %1)").arg(deviceChannel), QString(), ConnectionError);
-    });
-
-    connectionStates.openWebSocket->addTransition(webSocket, &WebSocket::connected, settleState);
-    connectionStates.openWebSocket->addTransition(webSocket, &WebSocket::error, connectionStates.error);
-    connectionStates.openWebSocket->addTransition(webSocket, &WebSocket::disconnected, connectionStates.error);
-    connectionStates.openWebSocket->addTransition(connectTimeoutTimer, &QTimer::timeout, connectionStates.error);
-
-    /* The settle timer drives the transition into the final connected state. A websocket error during the settle
-     * window still routes to the error state. */
-    settleState->addTransition(settleTimer, &QTimer::timeout, connectionStates.connected);
-    settleState->addTransition(webSocket, &WebSocket::error, connectionStates.error);
-    settleState->addTransition(webSocket, &WebSocket::disconnected, connectionStates.error);
-}
-
-void CANsub::configureTerminalStates(CANsubConnectionStates const& connectionStates)
-{
-    auto *connectionStateMachineCpy = connectionStateMachine;
-    connect(connectionStates.connected, &QState::entered, this, [this, connectionStateMachineCpy]
-    {
-        qDebug() << "Entering connectedState";
-
-        if (!connectionStateMachine || (connectionStateMachine != connectionStateMachineCpy))
-        {
-            /* The attempt was torn down (close()/destruction) before this deferred handler ran */
-            return;
-        }
-
-        stateMachineDestroy();
-        setState(ConnectedState);
-    }, Qt::QueuedConnection);
-
-    auto* const errorState = connectionStates.error;
-    connect(errorState, &QState::entered, this, [this, connectionStateMachineCpy]
-    {
-        qDebug() << "Entering errorState";
-
-        if (!connectionStateMachine || (connectionStateMachine != connectionStateMachineCpy))
-        {
-            /* The attempt was torn down (close()/destruction) before this deferred handler ran */
-            return;
-        }
-
-        /* Ensure that all actions touching this object are handles before the outside-visible changes */
-        QPointer<CANsub> alive(this);
-        stateMachineDestroy();
-        webSocket->abort();
-        if (alive)
-        {
-            /* A client slot may delete this device in response to either emission (PlotJuggler's DataStreamCAN does exactly
-             * that on ConnectionError), so guard the second against the first. */
-            setState(UnconnectedState);
-            if (alive)
-            {
-                reportPendingError();
-            }
-        }
-    },  Qt::QueuedConnection);
-}
+} // namespace CANsubQt

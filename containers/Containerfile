@@ -1,5 +1,8 @@
-# Build and tag using e.g. `> podman build --build-arg VCPKG_TRIPLET=arm64-linux-release -t cansub-builder-aarch64:vcpkg-2026.06.01 -f containers/Containerfile .`
-#                          `> podman build --build-arg VCPKG_TRIPLET=x64-linux-release -t cansub-builder-x64:vcpkg-2026.06.01 -f containers/Containerfile .`
+# Containerfile ensuring a consistent build environment.
+# Note that the same image is used for both Qt5 and Qt6 development.
+# Build and tag using e.g. `> podman build --build-arg VCPKG_TRIPLET=arm64-linux-release -t cansub-builder-aarch64:vcpkg-2026.10.16 -f containers/Containerfile .`
+#                          `> podman build --build-arg VCPKG_TRIPLET=x64-linux-release -t cansub-builder-x64:vcpkg-2026.10.16 -f containers/Containerfile .`
+# The image tag names the vcpkg version, which must match VCPKG_TAG below.
 
 FROM ubuntu:22.04
 
@@ -35,15 +38,12 @@ RUN apt-get update && apt-get install -y \
     libqt5serialport5-dev \
     libqt5svg5-dev \
     libqt5x11extras5-dev \
-    libqt5websockets5-dev \
     qt6-base-dev \
     qt6-tools-dev \
-    qt6-scxml-dev \
     libqt6serialbus6-bin \
     libqt6serialbus6-dev \
     libqt6serialport6-dev \
     libqt6svg6-dev \
-    libqt6websockets6-dev \
     && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
@@ -60,8 +60,8 @@ ENV VCPKG_TARGET_TRIPLET=$VCPKG_TRIPLET
 # so vcpkg resolves ports and versions from the git history of $VCPKG_ROOT instead of fetching the upstream repository
 # each time we configure the project (https://github.com/microsoft/vcpkg). The checkout therefore has to contain the
 # baseline commit named in vcpkg-configuration.json.
-ARG VCPKG_TAG=2026.06.01
-ARG VCPKG_BASELINE=f3e10653cc27d62a37a3763cd84b38bca07c6075
+ARG VCPKG_TAG=2026.10.16
+ARG VCPKG_BASELINE=9eec002df1cd109f8f104cd966a763daf9751489
 
 # Set environment variable to tell vcpkg to use system binaries for certain tools if needed
 ENV VCPKG_FORCE_SYSTEM_BINARIES=1
@@ -73,18 +73,6 @@ RUN mkdir -p $VCPKG_DEFAULT_BINARY_CACHE
 RUN git clone --depth 1 --branch $VCPKG_TAG https://github.com/microsoft/vcpkg.git $VCPKG_ROOT \
     && cd $VCPKG_ROOT \
     && ./bootstrap-vcpkg.sh -disableMetrics
-
-# Manually build the required packages to the binary cache
-RUN echo "Building for triplet: $VCPKG_TRIPLET" && \
-    $VCPKG_ROOT/vcpkg install \
-    boost-beast \
-    boost-crc \
-    boost-endian \
-    --triplet $VCPKG_TRIPLET && \
-    rm -rf $VCPKG_ROOT/buildtrees/* && \
-    rm -rf $VCPKG_ROOT/downloads/* && \
-    rm -rf $VCPKG_ROOT/installed/* && \
-    rm -rf $VCPKG_ROOT/packages/*
 
 # Tell CMake to always use vcpkg as the toolchain
 ENV CMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake

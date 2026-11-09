@@ -1,11 +1,8 @@
 {
   "dependencies": [
-    "boost-beast",
-    "boost-crc",
-    "boost-endian",
     {
       "name": "qt5",
-      "features": ["serialbus", "websockets"],
+      "features": ["serialbus"],
       "platform": "windows"
     }
   ]
